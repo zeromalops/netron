@@ -51,14 +51,16 @@ try:
 except ImportError:
     sys.exit("Missing: pip install netifaces")
 try:
-    from flask import Flask, render_template_string, jsonify, request
+    from flask import Flask, render_template_string, jsonify, request, Response
     from flask_socketio import SocketIO, emit
 except ImportError:
     sys.exit("Missing: pip install flask flask-socketio")
 try:
     import nmap
+    NMAP_OK = True
 except ImportError:
-    sys.exit("Missing: pip install python-nmap")
+    nmap = None
+    NMAP_OK = False
 try:
     import requests as _http
     REQUESTS_OK = True
@@ -801,7 +803,7 @@ def detect_os(ip: str, hostname: str, mac: str,
 # ─────────────────────────────────────────────────────────────────────────────
 class NetworkScanner:
     def __init__(self):
-        self.nm = nmap.PortScanner()
+        self.nm = nmap.PortScanner() if NMAP_OK else None
         self._strategy: Optional[str] = None   # cached working strategy
 
     # ── Discovery ─────────────────────────────────────────────────────────────
@@ -841,11 +843,15 @@ class NetworkScanner:
         return [{"ip": r.psrc, "mac": r.hwsrc.upper()} for _, r in ans]
 
     def _nmap_arp(self, network: str) -> List[dict]:
+        if not self.nm:
+            return []
         self.nm.scan(hosts=network, arguments="-sn -PR --host-timeout 3s -T5")
         return [{"ip": h, "mac": self.nm[h]["addresses"].get("mac","N/A")}
                 for h in self.nm.all_hosts()]
 
     def _nmap_ping(self, network: str) -> List[dict]:
+        if not self.nm:
+            return []
         self.nm.scan(hosts=network, arguments="-sn -PE -PS22,80,443,8080 --host-timeout 3s -T5")
         return [{"ip": h, "mac": self.nm[h]["addresses"].get("mac","N/A")}
                 for h in self.nm.all_hosts()]
@@ -898,6 +904,8 @@ class NetworkScanner:
 
     def port_scan(self, ip: str) -> dict:
         """Returns {port: {state, service, version, protocol}}"""
+        if not self.nm:
+            return self._tcp_fallback(ip)
         ports = "21-25,53,80,110,135,139,143,161,389,443,445,512-514,1433,1521,3306,3389,5432,5900,6379,8080,8443,9200,27017"
         args  = ("-sV --host-timeout 12s -T5" if IS_ROOT
                  else "-sT --host-timeout 12s -T5")
@@ -989,7 +997,7 @@ class NetworkScanner:
     # ── nmap OS (root only) ───────────────────────────────────────────────────
 
     def nmap_os(self, ip: str) -> Tuple[str, str]:
-        if not IS_ROOT:
+        if not IS_ROOT or not self.nm:
             return "", ""
         try:
             self.nm.scan(ip, arguments="-O --host-timeout 8s -T5")
@@ -1193,6 +1201,8 @@ class NetworkMonitor:
         self._running = True
         # Step 1: instant ARP-cache seed (shows devices in ~1s)
         threading.Thread(target=self._quick_arp_seed, daemon=True, name="arp-seed").start()
+        # Step 1b: fast ongoing ARP watch so newly-connected devices appear immediately
+        threading.Thread(target=self._arp_watch_loop, daemon=True, name="arp-watch").start()
         # Step 2: full nmap scan (slower, fills in ports/OS/vulns)
         threading.Thread(target=self._full_scan,      daemon=True, name="scan0").start()
         threading.Thread(target=self._scan_loop,       daemon=True, name="scan-loop").start()
@@ -1204,6 +1214,65 @@ class NetworkMonitor:
             time.sleep(SCAN_INTERVAL)
             self._full_scan()
 
+    def _register_arp_host(self, ip: str, mac: str) -> Optional[dict]:
+        """
+        Fast registration of a host discovered from the OS ARP table.
+        Adds it to `devices` (if absent) and emits device_update so the UI
+        reflects it immediately. Returns the entry (or None if unchanged).
+        Also flips a previously-offline device back to online (reconnect) so
+        it reappears in the UI without waiting for the full nmap sweep.
+        Vendor lookup + a quick TTL ping fill in the first-pass details; the
+        full nmap deep-scan later refines open ports / OS / vulnerabilities.
+        """
+        mac = (mac or "N/A").upper()
+        # Never register the monitoring host itself as a network device.
+        # Its own IP(s) appear in the OS ARP table and would otherwise show up
+        # as bogus "Unknown" nodes on the graph.
+        try:
+            if ip in get_local_ips():
+                return None
+        except Exception:
+            pass
+        with _lock:
+            existing = devices.get(ip)
+            if existing is not None and existing.get("status") == "online":
+                return None
+        if existing is not None and existing.get("status") == "offline":
+            # Reconnect: bring it back online immediately
+            existing["status"] = "online"
+            existing["last_seen"] = _ts()
+            if mac != "N/A":
+                existing["mac"] = mac
+            socketio.emit("device_update", existing)
+            return existing
+        vendor, dtype, brand = lookup_vendor(mac)
+        ttl      = self.scanner.ping_ttl(ip)
+        os_hint  = ("Linux / Android / macOS"   if 0 < ttl <= 64  else
+                    "Windows / Android"          if ttl <= 128     else
+                    "iOS / Network Device"       if ttl > 128      else
+                    "Linux / Android / iOS / macOS")
+        # Apply fallbacks for display
+        dv  = vendor if vendor and vendor.lower() not in ("unknown","") else ip
+        db  = brand  if brand  and brand.lower()  not in ("unknown","") else ip
+        ddt = dtype  if dtype  and dtype.lower()  not in ("unknown","") else ip
+        entry = {
+            "ip": ip, "mac": mac, "hostname": "",
+            "vendor": dv, "brand": db, "device_type": ddt,
+            "os": os_hint, "os_accuracy": "ARP (fast scan pending)",
+            "ttl": ttl, "open_ports": {}, "vulnerabilities": [],
+            "vuln_count": 0, "status": "online", "blocked": False,
+            "first_seen": _ts(), "last_seen": _ts(),
+            "bytes_in": 0, "bytes_out": 0,
+            "is_gateway": (ip == self.gateway),
+        }
+        with _lock:
+            if ip not in devices:     # double-check after lock
+                devices[ip] = entry
+            else:
+                return None
+        socketio.emit("device_update", devices[ip])
+        return devices[ip]
+
     def _quick_arp_seed(self):
         """
         Phase 1 of startup: read the OS ARP table and emit devices immediately
@@ -1214,42 +1283,33 @@ class NetworkMonitor:
         hosts = self.scanner._arp_table(self.network)
         if not hosts:
             return
-
-        def _seed_one(h: dict):
-            ip, mac = h["ip"], h.get("mac","N/A")
-            with _lock:
-                if ip in devices:
-                    return    # full scan already populated this device
-            # Vendor lookup – may hit live API if MAC not in built-in table
-            vendor, dtype, brand = lookup_vendor(mac)
-            # Quick ping for TTL-based OS guess
-            ttl      = self.scanner.ping_ttl(ip)
-            os_hint  = ("Linux / Android / macOS"   if 0 < ttl <= 64  else
-                        "Windows / Android"          if ttl <= 128     else
-                        "iOS / Network Device"       if ttl > 128      else
-                        "Linux / Android / iOS / macOS")
-            # Apply fallbacks for display
-            dv  = vendor if vendor and vendor.lower() not in ("unknown","") else ip
-            db  = brand  if brand  and brand.lower()  not in ("unknown","") else ip
-            ddt = dtype  if dtype  and dtype.lower()  not in ("unknown","") else ip
-            entry = {
-                "ip": ip, "mac": mac, "hostname": "",
-                "vendor": dv, "brand": db, "device_type": ddt,
-                "os": os_hint, "os_accuracy": "ARP (fast scan pending)",
-                "ttl": ttl, "open_ports": {}, "vulnerabilities": [],
-                "vuln_count": 0, "status": "online", "blocked": False,
-                "first_seen": _ts(), "last_seen": _ts(),
-                "bytes_in": 0, "bytes_out": 0,
-                "is_gateway": (ip == self.gateway),
-            }
-            with _lock:
-                if ip not in devices:     # double-check after lock
-                    devices[ip] = entry
-            socketio.emit("device_update", devices[ip])
-
         # Seed all devices in parallel (each may do a network call for vendor)
         with ThreadPoolExecutor(max_workers=16, thread_name_prefix="seed") as ex:
-            list(ex.map(_seed_one, hosts))
+            list(ex.map(lambda h: self._register_arp_host(h["ip"], h.get("mac","N/A")), hosts))
+
+    def _arp_watch_loop(self):
+        """
+        Fast ongoing detection of newly-connected devices (and re-detection of
+        devices that left the ARP cache). Polls the OS ARP table every few
+        seconds (cheap, no nmap) so a device that joins the network shows up in
+        the UI almost immediately – well before the next full 15s sweep.
+        """
+        while self._running:
+            try:
+                hosts = self.scanner._arp_table(self.network)
+                if hosts:
+                    # Starter hosts only: skip ones we already track (online)
+                    new = [h for h in hosts
+                           if h["ip"] not in devices
+                           or devices.get(h["ip"], {}).get("status") != "online"]
+                    if new:
+                        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="arpwatch") as ex:
+                            list(ex.map(
+                                lambda h: self._register_arp_host(h["ip"], h.get("mac","N/A")),
+                                new))
+            except Exception:
+                pass
+            time.sleep(3)
 
     def _full_scan(self):
         hosts = self.scanner.discover(self.network)
@@ -1257,8 +1317,16 @@ class NetworkMonitor:
             net_stats["scan_count"] += 1
         seen = set()
         futures = []
+        # The monitoring host itself is not a device to display
+        local_ips = set()
+        try:
+            local_ips = get_local_ips()
+        except Exception:
+            pass
         for h in hosts:
             ip, mac = h["ip"], h.get("mac","N/A")
+            if ip in local_ips:
+                continue   # never show/track the machine running NetSentinel
             seen.add(ip)
             is_new = ip not in devices
             # lookup_vendor is fast if cached; _deep_scan will re-query if needed
@@ -1624,306 +1692,135 @@ def _refine_dtype(dtype: str, vendor: str, os_str: str, ports: dict,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  IP OSINT ENGINE  – queries Shodan, Censys, AbuseIPDB, and AlienVault OTX
+#  DEVICE ACTIVITIES ENGINE  – real-time per-device traffic analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
-# API keys are loaded from the .env file (see _load_env() above)
-_SHODAN_KEY   = os.environ.get("SHODAN_API_KEY",   "")
-_CENSYS_ID    = os.environ.get("CENSYS_API_ID",    "")
-_CENSYS_SEC   = os.environ.get("CENSYS_API_SECRET","")
-_ABUSEIPDB_KEY= os.environ.get("ABUSEIPDB_API_KEY","")
-_OTX_KEY      = os.environ.get("OTX_API_KEY",      "")
-
-# In-memory OSINT result cache to avoid re-querying the same IP repeatedly
-_osint_cache: Dict[str, dict] = {}
-_osint_lock  = threading.Lock()
-
-
-def _osint_shodan(ip: str) -> dict:
-    """Query Shodan InternetDB + Shodan host API for open ports, vulns, tags."""
-    result: dict = {"source": "Shodan", "ok": False}
-    if not REQUESTS_OK:
-        return result
-    try:
-        # InternetDB – free, no key required, fast
-        r = _http.get(f"https://internetdb.shodan.io/{ip}", timeout=6)
-        if r.status_code == 200:
-            d = r.json()
-            result.update({
-                "ok":        True,
-                "ports":     d.get("ports", []),
-                "cpes":      d.get("cpes", []),
-                "hostnames": d.get("hostnames", []),
-                "vulns":     d.get("vulns", []),
-                "tags":      d.get("tags", []),
-            })
-    except Exception as e:
-        result["error"] = str(e)
-
-    # Full host API (requires key) – extra detail: org, ISP, country, banners
-    if _SHODAN_KEY:
-        try:
-            r2 = _http.get(
-                f"https://api.shodan.io/shodan/host/{ip}",
-                params={"key": _SHODAN_KEY},
-                timeout=10,
-            )
-            if r2.status_code == 200:
-                d2 = r2.json()
-                result.update({
-                    "org":        d2.get("org", ""),
-                    "isp":        d2.get("isp", ""),
-                    "asn":        d2.get("asn", ""),
-                    "country":    d2.get("country_name", ""),
-                    "city":       d2.get("city", ""),
-                    "os":         d2.get("os", ""),
-                    "last_seen":  d2.get("last_update", ""),
-                    "banners":    [
-                        {
-                            "port":    s.get("port"),
-                            "product": s.get("product",""),
-                            "version": s.get("version",""),
-                            "banner":  (s.get("data","")[:200]).strip(),
-                        }
-                        for s in d2.get("data", [])[:5]
-                    ],
-                    "ok": True,
-                })
-        except Exception:
-            pass
-    return result
-
-
-def _osint_censys(ip: str) -> dict:
-    """Query Censys v2 hosts API – TLS certs, services, geolocation."""
-    result: dict = {"source": "Censys", "ok": False}
-    if not (REQUESTS_OK and _CENSYS_ID and _CENSYS_SEC):
-        if not _CENSYS_ID:
-            result["error"] = "No API key configured"
-        return result
-    try:
-        r = _http.get(
-            f"https://search.censys.io/api/v2/hosts/{ip}",
-            auth=(_CENSYS_ID, _CENSYS_SEC),
-            timeout=10,
-        )
-        if r.status_code == 200:
-            d = r.json().get("result", {})
-            loc  = d.get("location", {})
-            asys = d.get("autonomous_system", {})
-            svcs = []
-            for svc in d.get("services", [])[:8]:
-                svcs.append({
-                    "port":        svc.get("port"),
-                    "transport":   svc.get("transport_protocol",""),
-                    "service":     svc.get("service_name",""),
-                    "product":     svc.get("software",[{}])[0].get("product","") if svc.get("software") else "",
-                    "tls_subject": (svc.get("tls",{}).get("certificates",{})
-                                      .get("leaf_data",{}).get("subject_dn",""))[:80],
-                })
-            result.update({
-                "ok":       True,
-                "country":  loc.get("country",""),
-                "city":     loc.get("city",""),
-                "lat":      loc.get("coordinates",{}).get("latitude"),
-                "lon":      loc.get("coordinates",{}).get("longitude"),
-                "asn":      asys.get("asn",""),
-                "org":      asys.get("name",""),
-                "bgp":      asys.get("bgp_prefix",""),
-                "services": svcs,
-                "last_seen":d.get("last_updated_at",""),
-            })
-        elif r.status_code == 404:
-            result["error"] = "IP not found in Censys"
-        elif r.status_code == 403:
-            result["error"] = "Invalid Censys credentials"
-        else:
-            result["error"] = f"HTTP {r.status_code}"
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-def _osint_abuseipdb(ip: str) -> dict:
-    """Query AbuseIPDB for abuse reports, confidence score, usage type."""
-    result: dict = {"source": "AbuseIPDB", "ok": False}
-    if not (REQUESTS_OK and _ABUSEIPDB_KEY):
-        if not _ABUSEIPDB_KEY:
-            result["error"] = "No API key configured"
-        return result
-    try:
-        r = _http.get(
-            "https://api.abuseipdb.com/api/v2/check",
-            headers={"Key": _ABUSEIPDB_KEY, "Accept": "application/json"},
-            params={"ipAddress": ip, "maxAgeInDays": 90, "verbose": True},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            d = r.json().get("data", {})
-            reports = d.get("reports", [])[:5]
-            result.update({
-                "ok":             True,
-                "abuse_score":    d.get("abuseConfidenceScore", 0),
-                "total_reports":  d.get("totalReports", 0),
-                "distinct_users": d.get("numDistinctUsers", 0),
-                "last_reported":  d.get("lastReportedAt", ""),
-                "usage_type":     d.get("usageType", ""),
-                "isp":            d.get("isp", ""),
-                "domain":         d.get("domain", ""),
-                "country":        d.get("countryCode", ""),
-                "is_tor":         d.get("isTor", False),
-                "is_public":      d.get("isPublic", True),
-                "is_whitelisted": d.get("isWhitelisted", False),
-                "reports":        [
-                    {
-                        "reported_at": rep.get("reportedAt",""),
-                        "comment":     (rep.get("comment","") or "")[:120],
-                        "categories":  rep.get("categories",[]),
-                    }
-                    for rep in reports
-                ],
-            })
-        elif r.status_code == 422:
-            result["error"] = "Private IP – not in AbuseIPDB"
-        elif r.status_code == 401:
-            result["error"] = "Invalid AbuseIPDB API key"
-        else:
-            result["error"] = f"HTTP {r.status_code}"
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-# AbuseIPDB category codes → human-readable names
-_ABUSE_CATS = {
-    1:"DNS Compromise", 2:"DNS Poisoning", 3:"Fraud Orders", 4:"DDoS Attack",
-    5:"FTP Brute-Force", 6:"Ping of Death", 7:"Phishing", 8:"Fraud VoIP",
-    9:"Open Proxy", 10:"Web Spam", 11:"Email Spam", 12:"Blog Spam",
-    13:"VPN IP", 14:"Port Scan", 15:"Hacking", 16:"SQL Injection",
-    17:"Spoofing", 18:"Brute-Force", 19:"Bad Web Bot", 20:"Exploited Host",
-    21:"Web App Attack", 22:"SSH", 23:"IoT Targeted",
-}
-
-
-def _osint_otx(ip: str) -> dict:
-    """Query AlienVault OTX for threat pulse indicators."""
-    result: dict = {"source": "AlienVault OTX", "ok": False}
-    if not (REQUESTS_OK and _OTX_KEY):
-        if not _OTX_KEY:
-            result["error"] = "No API key configured"
-        return result
-    headers = {"X-OTX-API-KEY": _OTX_KEY}
-    base    = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}"
-    try:
-        # General info
-        r = _http.get(f"{base}/general", headers=headers, timeout=10)
-        if r.status_code == 200:
-            d = r.json()
-            pulses = d.get("pulse_info", {})
-            result.update({
-                "ok":          True,
-                "pulse_count": pulses.get("count", 0),
-                "reputation":  d.get("reputation", 0),
-                "country":     d.get("country_name",""),
-                "asn":         d.get("asn",""),
-                "city":        d.get("city",""),
-                "pulses":      [
-                    {
-                        "name":       p.get("name","")[:80],
-                        "tags":       p.get("tags",[])[:5],
-                        "created":    p.get("created","")[:10],
-                        "adversary":  p.get("adversary",""),
-                        "malware_families": p.get("malware_families",[])[:3],
-                    }
-                    for p in pulses.get("pulses",[])[:5]
-                ],
-            })
-        elif r.status_code == 400:
-            result["error"] = "Private/invalid IP for OTX"
-        elif r.status_code == 403:
-            result["error"] = "Invalid OTX API key"
-        else:
-            result["error"] = f"HTTP {r.status_code}"
-        # Passive DNS
-        r2 = _http.get(f"{base}/passive_dns", headers=headers, timeout=8)
-        if r2.status_code == 200:
-            pdns = r2.json().get("passive_dns", [])[:5]
-            result["passive_dns"] = [
-                {"hostname": p.get("hostname",""), "first": p.get("first","")[:10],
-                 "last": p.get("last","")[:10]}
-                for p in pdns
-            ]
-        # Malware
-        r3 = _http.get(f"{base}/malware", headers=headers, timeout=8)
-        if r3.status_code == 200:
-            mal = r3.json().get("data", [])[:5]
-            result["malware"] = [m.get("hash","") for m in mal]
-    except Exception as e:
-        result["error"] = str(e)
-    return result
-
-
-def run_osint(ip: str, force: bool = False) -> dict:
+def get_device_activities(ip: str) -> dict:
     """
-    Run all configured OSINT sources for an IP in parallel.
-    Results are cached; pass force=True to refresh.
+    Process packet_log for a device and return structured activity data:
+    - requests_over_time: [{ts, count}] for the graph
+    - sites_visited: [{domain, ip, count}] (from DNS queries + direct connections)
+    - endpoints: [{port, service, count}] top endpoints contacted
+    - connections: [{src, dst, sport, dport, proto, ts, info}] recent connections
+    - summary: {total_requests, total_bytes, unique_destinations, protocol_breakdown}
     """
-    with _osint_lock:
-        if not force and ip in _osint_cache:
-            cached = _osint_cache[ip]
-            # Return cache if it's less than 30 minutes old
-            if time.time() - cached.get("_ts", 0) < 1800:
-                return cached
+    with _lock:
+        pkts = list(packet_log.get(ip, []))
 
-    def _run_source(fn, name):
-        try:
-            return name, fn(ip)
-        except Exception as e:
-            return name, {"source": name, "ok": False, "error": str(e)}
+    if not pkts:
+        return {"ip": ip, "connections": [], "sites_visited": [],
+                "endpoints": [], "requests_over_time": [], "summary": {}}
 
-    sources = [
-        (_osint_shodan,    "shodan"),
-        (_osint_censys,    "censys"),
-        (_osint_abuseipdb, "abuseipdb"),
-        (_osint_otx,       "otx"),
-    ]
+    # ── Process packets ──────────────────────────────────────────────────────
+    dest_counter: Dict[str, int] = defaultdict(int)
+    endpoint_counter: Dict[str, int] = defaultdict(int)
+    dns_queries: Dict[str, str] = {}         # domain → resolved IP
+    connections: list = []
+    ts_buckets: Dict[str, int] = defaultdict(int)  # "HH:MM" → count
+    proto_counter: Dict[str, int] = defaultdict(int)
+    total_bytes = 0
 
-    results: dict = {
-        "_ip":  ip,
-        "_ts":  time.time(),
-        "_ran": True,
+    for pkt in pkts:
+        src     = pkt.get("src", "")
+        dst     = pkt.get("dst", "")
+        proto   = pkt.get("proto", "")
+        length  = pkt.get("len", 0)
+        info    = pkt.get("info", "")
+        sport   = pkt.get("sport")
+        dport   = pkt.get("dport")
+        ts_str  = pkt.get("ts", "")
+
+        total_bytes += length
+        proto_counter[proto] += 1
+
+        # Determine the "other end" of the connection
+        other = dst if src == ip else src
+        if other and other != ip:
+            dest_counter[other] += 1
+
+        # Extract endpoint (port)
+        if dport:
+            try:
+                svc = socket.getservbyport(dport, "tcp") if dport < 1024 else ""
+            except Exception:
+                svc = ""
+            ep_key = f":{dport}" + (f" ({svc})" if svc else "")
+            endpoint_counter[ep_key] += 1
+
+        # Detect DNS queries from info field
+        if "DNS" in info and info.startswith("DNS"):
+            domain = info.replace("DNS", "").strip()
+            if domain:
+                dns_queries[domain] = other or ""
+
+        # Time bucket (group by second for the graph)
+        if ts_str:
+            ts_buckets[ts_str] += 1
+
+        # Build connection record
+        connections.append({
+            "src": src, "dst": dst, "sport": sport, "dport": dport,
+            "proto": proto, "ts": ts_str, "info": info, "len": length,
+        })
+
+    # ── Build requests_over_time (sorted by time) ───────────────────────────
+    requests_over_time = [{"ts": k, "count": v} for k, v in sorted(ts_buckets.items())]
+    # Keep last 60 data points max
+    requests_over_time = requests_over_time[-60:]
+
+    # ── Build sites_visited (merge DNS + direct connections) ─────────────────
+    sites_map: Dict[str, dict] = {}
+    for domain, resolved_ip in dns_queries.items():
+        key = domain
+        if key not in sites_map:
+            sites_map[key] = {"domain": domain, "ip": resolved_ip, "count": 0}
+        sites_map[key]["count"] += 1
+
+    # Add non-DNS destinations as sites too (HTTP/HTTPS connections)
+    for dest_ip, count in dest_counter.items():
+        # Skip if it's the device itself or gateway-local
+        if dest_ip == ip:
+            continue
+        # Check if this IP already appears from DNS
+        already_dns = any(s["ip"] == dest_ip for s in sites_map.values())
+        if not already_dns:
+            sites_map[dest_ip] = {"domain": dest_ip, "ip": dest_ip, "count": count}
+
+    sites_visited = sorted(sites_map.values(), key=lambda x: -x["count"])[:30]
+
+    # ── Build endpoints (sorted by frequency) ───────────────────────────────
+    endpoints = [{"port": k, "count": v}
+                 for k, v in sorted(endpoint_counter.items(), key=lambda x: -x[1])[:20]]
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    summary = {
+        "total_requests": sum(proto_counter.values()),
+        "total_bytes": total_bytes,
+        "unique_destinations": len(dest_counter),
+        "protocol_breakdown": dict(proto_counter),
     }
 
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="osint") as ex:
-        futs = {ex.submit(_run_source, fn, name): name for fn, name in sources}
-        for fut in as_completed(futs):
-            try:
-                name, data = fut.result(timeout=20)
-                results[name] = data
-            except Exception:
-                results[futs[fut]] = {"source": futs[fut], "ok": False, "error": "timeout"}
+    return {
+        "ip": ip,
+        "connections": connections[:100],     # last 100 connections
+        "sites_visited": sites_visited,
+        "endpoints": endpoints,
+        "requests_over_time": requests_over_time,
+        "summary": summary,
+    }
 
-    # Compute overall threat level from all sources
-    score = 0
-    abuse = results.get("abuseipdb", {})
-    otx   = results.get("otx", {})
-    if abuse.get("ok"):
-        score = max(score, abuse.get("abuse_score", 0))
-    if otx.get("ok") and otx.get("pulse_count", 0) > 0:
-        score = max(score, min(100, otx["pulse_count"] * 15))
 
-    results["_threat_score"] = score
-    results["_threat_level"] = (
-        "CRITICAL" if score >= 80 else
-        "HIGH"     if score >= 50 else
-        "MEDIUM"   if score >= 20 else
-        "LOW"       if score >  0  else
-        "CLEAN"
-    )
-
-    with _osint_lock:
-        _osint_cache[ip] = results
-    return results
+def get_all_activities_summary() -> dict:
+    """Return a summary of activity counts for all devices (for the device grid)."""
+    result = {}
+    with _lock:
+        for ip, pkts in packet_log.items():
+            pkt_list = list(pkts)
+            result[ip] = {
+                "total_requests": len(pkt_list),
+                "last_activity": pkt_list[0].get("ts", "") if pkt_list else "",
+            }
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FLASK + SOCKET.IO
@@ -2379,38 +2276,50 @@ def api_speedtest():
 
 
 
-@app.route("/api/osint/<path:ip>")
-def api_osint_ip(ip):
-    """Run OSINT for a single IP. Pass ?refresh=1 to bypass cache."""
-    force = request.args.get("refresh","0") == "1"
-    result = run_osint(ip, force=force)
-    return jsonify(result)
+@app.route("/api/activities/<path:ip>")
+def api_activities_ip(ip):
+    """Return processed activity data for a single device."""
+    return jsonify(get_device_activities(ip))
 
-@app.route("/api/osint/all", methods=["POST"])
-def api_osint_all():
-    """Kick off background OSINT scans for every known device IP."""
-    ips = list(devices.keys())
-    def _bg():
-        for ip in ips:
-            run_osint(ip)
-    threading.Thread(target=_bg, daemon=True, name="osint-all").start()
-    return jsonify({"ok": True, "scanning": ips})
+@app.route("/api/activities/summary")
+def api_activities_summary():
+    """Return activity summary for all devices (for the device grid)."""
+    return jsonify(get_all_activities_summary())
 
-@app.route("/api/osint/status")
-def api_osint_status():
-    """Return cached OSINT results for all devices (without re-querying)."""
-    with _osint_lock:
-        return jsonify({ip: r for ip, r in _osint_cache.items()})
 
-@app.route("/api/osint/keys")
-def api_osint_keys():
-    """Return which API keys are configured (never expose the actual values)."""
-    return jsonify({
-        "shodan":    bool(_SHODAN_KEY),
-        "censys":    bool(_CENSYS_ID and _CENSYS_SEC),
-        "abuseipdb": bool(_ABUSEIPDB_KEY),
-        "otx":       bool(_OTX_KEY),
-    })
+@app.route("/favicon/<path:host>")
+def api_site_favicon(host):
+    """Proxy a site's favicon server-side so the browser avoids CORS issues.
+
+    Returns the fetched image bytes with permissive CORS headers; 404 if it
+    cannot be retrieved (the frontend then falls back to the globe icon).
+    """
+    if not host:
+        return ("", 404)
+    bytes_io = _fetch_site_favicon(host)
+    if bytes_io is None:
+        return ("", 404)
+    data = bytes_io.getvalue()
+    resp = Response(data, status=200)
+    resp.headers["Content-Type"] = "image/png"
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+def _fetch_site_favicon(host: str):
+    """Fetch a favicon for host (Google s2 service), returning a BytesIO or None."""
+    if not REQUESTS_OK:
+        return None
+    try:
+        url = f"https://www.google.com/s2/favicons?domain={host}&sz=64"
+        r = _http.get(url, timeout=4, headers={"User-Agent": "NetSentinel/3.0"})
+        if r.status_code == 200 and r.content:
+            import io
+            return io.BytesIO(r.content)
+    except Exception:
+        pass
+    return None
 
 @app.route("/api/rescan/<ip>", methods=["POST"])
 def api_rescan(ip):
@@ -2431,7 +2340,18 @@ def api_topology():
         gw_ip = monitor.gateway
         node_list = []
         seen_ips = set()
+        # Reflect all known devices in the graph – including ones that have
+        # disconnected (shown as offline) so the operator can see the device
+        # (and its reconnect when it comes back). Caching is kept but driven by
+        # accurate real packet data. The monitoring host itself is excluded.
+        local_ips = set()
+        try:
+            local_ips = get_local_ips()
+        except Exception:
+            pass
         for ip, d in devices.items():
+            if ip in local_ips:
+                continue   # the monitoring host itself is not a network device
             seen_ips.add(ip)
             node_list.append({
                 "ip": ip, "hostname": d.get("hostname",""),
@@ -2444,6 +2364,7 @@ def api_topology():
                 "bytes_in":   d.get("bytes_in",0),
                 "bytes_out":  d.get("bytes_out",0),
                 "mac": d.get("mac",""),
+                "last_seen": d.get("last_seen",""),
             })
         # Always include gateway node even if not yet scanned
         if gw_ip and gw_ip not in seen_ips:
@@ -2617,7 +2538,7 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 /* CHART CARDS */
 .chart-card{background:var(--bg2);border:1px solid var(--border);border-radius:9px;padding:14px;margin-bottom:14px}
 .chart-lbl{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
-canvas{max-height:200px}
+.chart-card canvas{max-height:200px}
 
 /* PORT CARDS */
 .port-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:7px;margin-bottom:14px}
@@ -2749,7 +2670,7 @@ canvas{max-height:200px}
   <div class="nav-item"        data-panel="vulns"      onclick="nav(this,'vulns')"><span class="nav-icon">🔓</span>Vulnerabilities</div>
   <div class="nav-item"        data-panel="ports"      onclick="nav(this,'ports')"><span class="nav-icon">🔌</span>Open Ports</div>
   <div class="nav-item"        data-panel="graphs"     onclick="nav(this,'graphs')"><span class="nav-icon">📈</span>Bandwidth</div>
-  <div class="nav-item"        data-panel="osint"      onclick="nav(this,'osint')"><span class="nav-icon">🔍</span>IP OSINT</div>
+  <div class="nav-item"        data-panel="activities" onclick="nav(this,'activities')"><span class="nav-icon">📊</span>Activities</div>
 
   <div style="margin-top:16px">
     <div class="sb-title">System</div>
@@ -2884,7 +2805,7 @@ canvas{max-height:200px}
 
   <!-- ── NETWORK TOPOLOGY GRAPH ── -->
   <div id="topo-wrap" style="background:var(--bg2);border:1px solid var(--border);
-       border-radius:12px;position:relative;overflow:hidden;margin-bottom:16px">
+       border-radius:12px;position:relative;overflow:hidden;margin:20px 0">
 
     <!-- Toolbar -->
     <div id="topo-toolbar" style="display:flex;align-items:center;justify-content:space-between;
@@ -3028,33 +2949,163 @@ canvas{max-height:200px}
   <div id="graphs-content"></div>
 </div>
 
-<!-- IP OSINT -->
-<div class="panel" id="panel-osint">
+<!-- ACTIVITIES -->
+<div class="panel" id="panel-activities">
 
   <!-- Toolbar -->
   <div class="sec-hdr">
-    <div class="sec-title">🔍 IP OSINT — Public Threat Intelligence</div>
+    <div class="sec-title">📊 Activities — Real-Time Device Traffic</div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <span id="osint-key-badges" style="display:flex;gap:5px"></span>
-      <button class="btn" onclick="osintScanAll()" id="osint-scan-btn">▶ Scan All Devices</button>
-      <button class="btn" onclick="osintClearAll()">🗑 Clear</button>
+      <button class="btn" onclick="actRefreshAll()">↻ Refresh All</button>
     </div>
   </div>
 
   <!-- Device selector grid -->
-  <div id="osint-device-grid" style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:16px"></div>
+  <div id="act-device-grid" style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:16px"></div>
 
   <!-- Main results area -->
-  <div id="osint-results">
+  <div id="act-results">
     <div style="color:var(--muted);text-align:center;padding:40px;font-size:13px">
-      Click a device above or <b>Scan All Devices</b> to query public OSINT databases.<br>
+      Click a device above to view real-time activity details.<br>
       <span style="font-size:11px;margin-top:6px;display:block">
-        Sources: Shodan · Censys · AbuseIPDB · AlienVault OTX
+        Shows: sites visited · endpoints · connections · request graph
       </span>
     </div>
   </div>
 
 </div>
+
+<!-- ACTIVITY POPUP MODAL — EtherApe-style dark UI -->
+<div id="act-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+     background:rgba(0,0,0,.7);z-index:10000;overflow:hidden;
+     align-items:center;justify-content:center">
+  <div id="act-popup" style="width:95vw;height:92vh;background:#1a1d23;border:1px solid #333;
+       border-radius:6px;display:flex;flex-direction:column;overflow:hidden;font-family:'Segoe UI',sans-serif;
+       box-shadow:0 8px 32px rgba(0,0,0,.6)">
+
+      <!-- Title bar -->
+      <div id="act-titlebar" style="display:flex;align-items:center;justify-content:center;
+           background:#1e2128;padding:6px 12px;border-bottom:1px solid #333;position:relative;
+           -webkit-user-select:none;user-select:none">
+        <div style="font-size:12px;font-weight:600;color:#e0e0e0;text-align:center" id="act-popup-title">
+          Device Activity</div>
+        <div onclick="actClosePopup()" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);
+             width:24px;height:24px;display:flex;align-items:center;justify-content:center;
+             border-radius:4px;cursor:pointer;color:#ff4444;font-size:14px;font-weight:700;
+             background:rgba(255,68,68,.1);border:1px solid rgba(255,68,68,.3)"
+             onmouseover="this.style.background='rgba(255,68,68,.25)'"
+             onmouseout="this.style.background='rgba(255,68,68,.1)'">✕</div>
+      </div>
+
+      <!-- Menu bar -->
+      <div style="display:flex;gap:0;background:#22252a;border-bottom:1px solid #333;
+           padding:0 4px;font-size:11px">
+        <div class="act-menu-item">File</div>
+        <div class="act-menu-item">Capture</div>
+        <div class="act-menu-item">View</div>
+        <div class="act-menu-item">Help</div>
+      </div>
+
+      <!-- Toolbar -->
+      <div style="display:flex;align-items:center;gap:2px;background:#1e2128;
+           padding:4px 8px;border-bottom:1px solid #333">
+        <div class="act-tb-btn" onclick="actToolbarAction('start')" title="Start capture">
+          <div style="font-size:14px">▶</div><div style="font-size:8px;color:#aaa">Start</div></div>
+        <div class="act-tb-btn" onclick="actToolbarAction('next')" title="Next packet">
+          <div style="font-size:14px">⏭</div><div style="font-size:8px;color:#aaa">Next</div></div>
+        <div class="act-tb-btn" onclick="actToolbarAction('pause')" title="Pause">
+          <div style="font-size:14px">⏸</div><div style="font-size:8px;color:#aaa">Pause</div></div>
+        <div class="act-tb-btn" onclick="actToolbarAction('stop')" title="Stop">
+          <div style="font-size:14px">⏹</div><div style="font-size:8px;color:#aaa">Stop</div></div>
+        <div style="width:1px;height:24px;background:#444;margin:0 4px"></div>
+        <div class="act-tb-btn" onclick="actToolbarAction('pref')" title="Preferences">
+          <div style="font-size:14px">☰</div><div style="font-size:8px;color:#aaa">Pref.</div></div>
+        <div class="act-tb-btn" onclick="actToolbarAction('proto')" title="Protocols">
+          <div style="font-size:14px">≡</div><div style="font-size:8px;color:#aaa">Prot.</div></div>
+        <div class="act-tb-btn" onclick="actToolbarAction('nodes')" title="Nodes">
+          <div style="font-size:14px">◉</div><div style="font-size:8px;color:#aaa">Nodes</div></div>
+        <div style="flex:1"></div>
+        <div style="font-size:10px;color:#888;font-family:'JetBrains Mono',monospace" id="act-popup-sub"></div>
+      </div>
+
+      <!-- Main area: sidebar + canvas -->
+      <div style="display:flex;flex:1;min-height:0;overflow:hidden">
+        <!-- Left sidebar: Protocols -->
+        <div style="width:160px;min-width:160px;background:#181b21;border-right:1px solid #333;
+             display:flex;flex-direction:column;overflow:hidden;flex-shrink:0">
+          <div style="padding:6px 8px;font-size:10px;font-weight:700;color:#aaa;
+               border-bottom:1px solid #333;text-transform:uppercase;letter-spacing:.5px">
+            Protocols</div>
+          <div id="act-proto-list" style="flex:1;overflow-y:auto;padding:4px 0"></div>
+        </div>
+
+        <!-- Main canvas -->
+        <div style="flex:1;position:relative;background:#0a0c10;overflow:hidden;min-width:0">
+          <canvas id="act-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;max-height:none;cursor:grab;z-index:1"></canvas>
+          <!-- Node tooltip -->
+          <div id="act-tip" style="position:absolute;pointer-events:none;display:none;
+               background:var(--bg3);border:1px solid var(--border);border-radius:9px;
+               padding:11px 15px;font-size:11px;min-width:220px;max-width:300px;
+               z-index:20;box-shadow:0 6px 28px rgba(0,0,0,.7)"></div>
+          <!-- Zoom controls -->
+          <div style="position:absolute;bottom:12px;right:12px;display:flex;flex-direction:column;gap:4px;z-index:10">
+            <div onclick="actZoomIn()" style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+                 background:rgba(20,22,28,.9);border:1px solid #444;border-radius:4px;cursor:pointer;
+                 color:#ccc;font-size:16px;font-weight:700" title="Zoom In"
+                 onmouseover="this.style.borderColor='var(--accent)';this.style.color='#fff'"
+                 onmouseout="this.style.borderColor='#444';this.style.color='#ccc'">+</div>
+            <div onclick="actZoomReset()" style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+                 background:rgba(20,22,28,.9);border:1px solid #444;border-radius:4px;cursor:pointer;
+                 color:#ccc;font-size:10px;font-weight:600" title="Reset Zoom"
+                 onmouseover="this.style.borderColor='var(--accent)';this.style.color='#fff'"
+                 onmouseout="this.style.borderColor='#444';this.style.color='#ccc'">⊙</div>
+            <div onclick="actZoomOut()" style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+                 background:rgba(20,22,28,.9);border:1px solid #444;border-radius:4px;cursor:pointer;
+                 color:#ccc;font-size:16px;font-weight:700" title="Zoom Out"
+                 onmouseover="this.style.borderColor='var(--accent)';this.style.color='#fff'"
+                 onmouseout="this.style.borderColor='#444';this.style.color='#ccc'">−</div>
+          </div>
+          <!-- Zoom level indicator -->
+          <div id="act-zoom-label" style="position:absolute;bottom:12px;left:12px;
+               background:rgba(20,22,28,.85);border:1px solid #333;border-radius:4px;
+               padding:3px 8px;font-size:10px;color:#888;font-family:'JetBrains Mono',monospace;z-index:10">
+            100%
+          </div>
+          <!-- Overlay info -->
+          <div id="act-canvas-info" style="position:absolute;top:8px;right:8px;
+               background:rgba(20,22,28,.85);border:1px solid #333;border-radius:4px;
+               padding:8px 10px;font-size:10px;color:#aaa;display:none;min-width:140px">
+          </div>
+          <!-- Live packet flash -->
+          <div id="act-pkt-flash" style="position:absolute;top:8px;left:8px;
+               background:rgba(0,229,255,.15);border:1px solid rgba(0,229,255,.3);border-radius:4px;
+               padding:4px 10px;font-size:11px;color:var(--accent);font-family:'JetBrains Mono',monospace;
+               display:none;z-index:10;transition:opacity .3s">
+          </div>
+        </div>
+      </div>
+
+      <!-- Status bar -->
+      <div style="background:#1e2128;border-top:1px solid #333;padding:3px 10px;
+           font-size:10px;color:#888;display:flex;align-items:center;gap:12px">
+        <span id="act-status-text">Ready</span>
+        <span style="flex:1"></span>
+        <span id="act-status-conn" style="color:#666"></span>
+      </div>
+    </div>
+</div>
+
+<style>
+  .act-menu-item{padding:4px 10px;color:#bbb;cursor:pointer;border-radius:3px;font-size:11px}
+  .act-menu-item:hover{background:rgba(0,229,255,.1);color:#fff}
+  .act-tb-btn{display:flex;flex-direction:column;align-items:center;padding:4px 10px;
+    border-radius:4px;cursor:pointer;color:#ccc;min-width:44px}
+  .act-tb-btn:hover{background:rgba(0,229,255,.1)}
+  .act-tb-btn:active{background:rgba(0,229,255,.2)}
+  #act-proto-list::-webkit-scrollbar,#act-canvas::-webkit-scrollbar{width:6px}
+  #act-proto-list::-webkit-scrollbar-track{background:transparent}
+  #act-proto-list::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+</style>
 
 
 </main>
@@ -3400,6 +3451,40 @@ const TOPO = (() => {
       return;
     }
 
+    if (cat === 'internet') {
+      // Globe: circle with longitude + latitude arcs
+      ctx2.beginPath(); ctx2.arc(0,0,s*0.55,0,Math.PI*2); ctx2.stroke();
+      // Longitude ellipse
+      ctx2.beginPath(); ctx2.ellipse(0,0,s*0.28,s*0.55,0,0,Math.PI*2); ctx2.stroke();
+      // Horizontal latitude line (equator)
+      ctx2.beginPath(); ctx2.moveTo(-s*0.55,0); ctx2.lineTo(s*0.55,0); ctx2.stroke();
+      // Upper latitude arc
+      ctx2.beginPath(); ctx2.ellipse(0,-s*0.14,s*0.42,s*0.41,0,Math.PI,Math.PI*2); ctx2.stroke();
+      // Lower latitude arc
+      ctx2.beginPath(); ctx2.ellipse(0,s*0.14,s*0.42,s*0.41,0,0,Math.PI); ctx2.stroke();
+      return;
+    }
+
+    if (cat === 'network') {
+      // Network connectivity icon: 3 dots connected by lines
+      const dot = s*0.16;
+      const pts = [[-s*0.5,-s*0.38],[s*0.45,-s*0.5],[s*0.2,s*0.48]];
+      // Connecting lines
+      ctx2.beginPath();
+      ctx2.moveTo(pts[0][0],pts[0][1]);
+      ctx2.lineTo(pts[1][0],pts[1][1]);
+      ctx2.lineTo(pts[2][0],pts[2][1]);
+      ctx2.closePath();
+      ctx2.globalAlpha = 0.6;
+      ctx2.stroke();
+      ctx2.globalAlpha = 1;
+      // Nodes
+      pts.forEach(([px,py]) => {
+        ctx2.beginPath(); ctx2.arc(px,py,dot,0,Math.PI*2); ctx2.fill();
+      });
+      return;
+    }
+
     // unknown – question mark circle
     ctx2.beginPath(); ctx2.arc(0,0,s*0.55,0,Math.PI*2); ctx2.stroke();
     ctx2.font = `bold ${Math.round(s*0.8)}px sans-serif`;
@@ -3461,11 +3546,12 @@ const TOPO = (() => {
     const panel   = document.getElementById('panel-overview');
     const dpr     = window.devicePixelRatio || 1;
     const w       = wrap.clientWidth || (window.innerWidth - 260);
-    // Height = viewport - header(52) - panel padding(36) - stat cards(~100)
-    //          - toolbar height - bottom section (charts+alerts, ~340px)
+    // Fit the topo panel (toolbar + canvas) within the left sidebar height,
+    // leaving a line of spacing at the top and bottom.
     const tbH   = (toolbar && toolbar.offsetHeight) || 44;
-    // Target: graph takes ~55% of viewport height, minimum 480px
-    const h     = Math.max(480, Math.round(window.innerHeight * 0.55) - tbH);
+    const sidebarH = window.innerHeight - 52 - 2; // header ~52px + 2px border
+    const space = 40; // combined top+bottom margin (20px each) + border 2px
+    const h     = Math.max(480, (sidebarH - tbH) - space);
     canvas.style.width  = w + 'px';
     canvas.style.height = h + 'px';
     canvas.width  = Math.floor(w * dpr);
@@ -4069,7 +4155,10 @@ const TOPO = (() => {
 
   function onInitialState(data){
     // Immediately seed nodes from the device list in initial_state
-    // so the graph shows devices even before the topology API fetch completes
+    // so the graph shows devices even before the topology API fetch completes.
+    // Both online and offline (disconnected) devices are seeded — offline ones
+    // render dimmed/gray, and reconnect flips them back to online. The
+    // /api/topology fetch (which excludes the monitoring host) finalizes the state.
     if (data && data.devices && data.devices.length > 0) {
       const synth = {
         gateway: data.stats ? data.stats.gateway : gateway,
@@ -4134,7 +4223,8 @@ const TOPO = (() => {
   }
 
   return {init,onTopoPacket,onDeviceUpdate,onInitialState,
-          togglePause,reset,zoomIn,zoomOut,fit,closeTrace};
+          togglePause,reset,zoomIn,zoomOut,fit,closeTrace,
+          category,drawIcon,roundRect,hexToRgba,nodeCol,fmtB};
 })();
 
 function topoTogglePause(){TOPO.togglePause();}
@@ -4553,7 +4643,7 @@ function nav(el,name){
   if(name==="graphs"){renderGraphs();}
   if(name==="ports"){renderPorts();}
   if(name==="vulns"){renderVulns();}
-  if(name==="osint"){osintInit();}
+  if(name==="activities"){actInit();}
 }
 
 // ── INTERNET SPEED TEST ──────────────────────────────────────────────────────
@@ -4800,430 +4890,950 @@ window.addEventListener('load', () => setTimeout(ensureTopoInit, 200));
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  IP OSINT  –  query Shodan / Censys / AbuseIPDB / AlienVault OTX
+//  ACTIVITIES  –  EtherApe-style real-time network graph per device
 // ═══════════════════════════════════════════════════════════════════════════
 
-const OSINT_STATE = {
-  results:  {},   // ip → result dict
-  scanning: new Set(),
-  inited:   false,
+const ACT_STATE = {
+  currentIP: null,
+  data: null,
+  animFrame: null,
+  nodes: [],
+  edges: [],
+  paused: false,
+  protoFilter: null,
+  _pktBuf: [],
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  _dragging: false,
+  selectedIP: null,
+  _dragNode: null,       // {id, ox, oy} for independent node dragging
+  _dragStartX: 0,
+  _dragStartY: 0,
+  _panStartX: 0,
+  _panStartY: 0,
 };
 
-const THREAT_COL = {
-  CRITICAL: "var(--red)",
-  HIGH:     "var(--orange)",
-  MEDIUM:   "var(--yellow)",
-  LOW:      "var(--green)",
-  CLEAN:    "var(--green)",
+// Protocol colors (user-specified)
+const ACT_PROTO_COLORS = {
+  HTTPS:          '#ff4444',
+  DOMAIN:         '#4488ff',
+  'UDP-UNKNOWN':  '#00e676',
+  ICMP:           '#00e5ff',
+  HTTP:           '#ff4444',
+  POSTGRESQL:     '#ffab40',
+  LOGIN:          '#e040fb',
+  EXEC:           '#ffffff',
+  LDAP:           '#ff6b35',
+  SNMP:           '#ff6b9d',
+  'MS-SQL-S':     '#90a4ae',
+  SHELL:          '#40c4ff',
+  REDIS:          '#90a4ae',
+  POP3:           '#00e676',
+  FTP:            '#ffab40',
+  TELNET:         '#e040fb',
+  'TCP-UNKNOWN':  '#ffffff',
+  'MICROSOFT-DS': '#ff6b35',
+  SMB:            '#ff80ab',
+  'HTTP-ALT':     '#90a4ae',
+  'MS-WBT-SERVER':'#4488ff',
+  MYSQL:          '#90a4ae',
+  SSH:            '#00e676',
+  TCP:            '#00e5ff',
+  UDP:            '#7c4dff',
+  DNS:            '#ff6b35',
+  OTHER:          '#90a4ae',
 };
 
-const ABUSE_CATS = {
-  1:"DNS Compromise",2:"DNS Poisoning",3:"Fraud Orders",4:"DDoS Attack",
-  5:"FTP Brute-Force",6:"Ping of Death",7:"Phishing",8:"Fraud VoIP",
-  9:"Open Proxy",10:"Web Spam",11:"Email Spam",12:"Blog Spam",
-  13:"VPN IP",14:"Port Scan",15:"Hacking",16:"SQL Injection",
-  17:"Spoofing",18:"Brute-Force",19:"Bad Web Bot",20:"Exploited Host",
-  21:"Web App Attack",22:"SSH",23:"IoT Targeted",
-};
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-function osintInit() {
-  if (OSINT_STATE.inited) { osintRefreshDeviceGrid(); return; }
-  OSINT_STATE.inited = true;
-  // Check which API keys are configured and show badges
-  fetch('/api/osint/keys').then(r=>r.json()).then(keys => {
-    const badgeEl = document.getElementById('osint-key-badges');
-    if (!badgeEl) return;
-    const kmap = {shodan:'Shodan',censys:'Censys',abuseipdb:'AbuseIPDB',otx:'OTX'};
-    badgeEl.innerHTML = Object.entries(kmap).map(([k,name]) =>
-      `<span style="font-size:9px;padding:2px 8px;border-radius:4px;
-        background:${keys[k]?'rgba(0,230,118,.1)':'rgba(61,80,104,.2)'};
-        border:1px solid ${keys[k]?'rgba(0,230,118,.35)':'rgba(61,80,104,.4)'};
-        color:${keys[k]?'var(--green)':'var(--muted)'}"
-        title="${keys[k]?name+' key loaded':name+' — add key to .env'}">
-        ${keys[k]?'✓':'✗'} ${name}</span>`
-    ).join('');
-  }).catch(()=>{});
-
-  // Load any cached results
-  fetch('/api/osint/status').then(r=>r.json()).then(data => {
-    Object.assign(OSINT_STATE.results, data);
-    osintRefreshDeviceGrid();
-  }).catch(()=>{});
-
-  osintRefreshDeviceGrid();
+function _actColor(proto) {
+  const p = (proto||'').toUpperCase();
+  if (ACT_PROTO_COLORS[p]) return ACT_PROTO_COLORS[p];
+  return ACT_PROTO_COLORS.OTHER;
 }
 
-// ── Device selector grid ──────────────────────────────────────────────────────
-function osintRefreshDeviceGrid() {
-  const grid = document.getElementById('osint-device-grid');
+// ── Device grid ──────────────────────────────────────────────────────────
+function actRefreshDeviceGrid() {
+  const grid = document.getElementById('act-device-grid');
   if (!grid) return;
   const devs = Object.values(S.devices)
     .filter(d => d.status !== 'offline')
     .sort((a,b)=>(a.ip||'').localeCompare(b.ip||'',undefined,{numeric:true}));
 
   grid.innerHTML = devs.map(d => {
-    const r    = OSINT_STATE.results[d.ip];
-    const tl   = r ? r._threat_level : null;
-    const isScanning = OSINT_STATE.scanning.has(d.ip);
-    const dotCol = isScanning ? 'var(--yellow)' :
-                   tl ? (THREAT_COL[tl]||'var(--muted)') : 'var(--muted)';
-    const dotTxt = isScanning ? '⏳' :
-                   tl === 'CLEAN'    ? '✓' :
-                   tl === 'LOW'      ? '●' :
-                   tl === 'MEDIUM'   ? '⚠' :
-                   tl === 'HIGH'     ? '⚠' :
-                   tl === 'CRITICAL' ? '🚨' : '·';
-    const vendor  = (d.brand||d.vendor||'').toLowerCase();
-    const isIP    = /^\d+\.\d+\.\d+\.\d+$/.test(vendor);
-    const label   = isIP ? d.ip : (d.brand||d.vendor||d.ip);
-    return `<div onclick="osintSelectDevice('${d.ip}')"
+    const sel = ACT_STATE.currentIP === d.ip;
+    const vendor = (d.brand||d.vendor||'').toLowerCase();
+    const isIP   = /^\d+\.\d+\.\d+\.\d+$/.test(vendor);
+    const label  = isIP ? d.ip : (d.brand||d.vendor||d.ip);
+    const bi = d.bytes_in||0, bo = d.bytes_out||0;
+    return `<div onclick="actSelectDevice('${d.ip}')"
       style="cursor:pointer;padding:8px 12px;border-radius:8px;
-             background:var(--bg3);border:1px solid var(--border);
+             background:${sel?'rgba(0,229,255,.07)':'var(--bg3)'};
+             border:1px solid ${sel?'var(--accent)':'var(--border)'};
              min-width:120px;transition:all .15s"
       onmouseover="this.style.borderColor='var(--accent)'"
-      onmouseout="this.style.borderColor='var(--border)'"
-      id="osint-chip-${d.ip.replace(/\./g,'-')}">
-      <div style="font-family:'JetBrains Mono',monospace;font-size:11px;
-                  color:var(--accent)">${d.ip}</div>
-      <div style="font-size:9px;color:var(--muted);margin-top:1px;
-                  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-                  max-width:110px" title="${label}">${label.substring(0,14)}</div>
-      <div style="margin-top:5px;display:flex;align-items:center;gap:5px">
-        <span style="color:${dotCol};font-size:11px">${dotTxt}</span>
-        <span style="font-size:9px;color:${dotCol}">${isScanning?'Scanning…':tl||'Not scanned'}</span>
-      </div>
+      onmouseout="this.style.borderColor='${sel?'var(--accent)':'var(--border)'}'"
+      id="act-chip-${d.ip.replace(/\\./g,'-')}">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">${d.ip}</div>
+      <div style="font-size:9px;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;
+                  white-space:nowrap;max-width:110px" title="${label}">${label.substring(0,14)}</div>
+      <div style="margin-top:5px;font-size:9px;color:var(--muted)">↑${_fmtAct(bo)} ↓${_fmtAct(bi)}</div>
     </div>`;
   }).join('');
 }
 
-// ── Scan all ──────────────────────────────────────────────────────────────────
-function osintScanAll() {
-  const btn = document.getElementById('osint-scan-btn');
-  if (btn) { btn.disabled=true; btn.textContent='⏳ Scanning…'; }
-  Object.values(S.devices).filter(d=>d.status!=='offline').forEach(d=>{
-    OSINT_STATE.scanning.add(d.ip);
-  });
-  osintRefreshDeviceGrid();
-  fetch('/api/osint/all', {method:'POST'}).then(r=>r.json()).then(data => {
-    // Poll for completion
-    let checks = 0;
-    const poll = setInterval(()=>{
-      checks++;
-      fetch('/api/osint/status').then(r=>r.json()).then(results=>{
-        const done = data.scanning.every(ip => results[ip]?._ran);
-        Object.assign(OSINT_STATE.results, results);
-        data.scanning.forEach(ip=>{
-          if (results[ip]?._ran) OSINT_STATE.scanning.delete(ip);
-        });
-        osintRefreshDeviceGrid();
-        if (done || checks > 30) {
-          clearInterval(poll);
-          if (btn) { btn.disabled=false; btn.textContent='▶ Scan All Devices'; }
-          // Auto-show results for first device
-          const first = data.scanning[0];
-          if (first && results[first]) osintShowResult(first, results[first]);
-        }
-      });
-    }, 3000);
-  }).catch(()=>{ if(btn){btn.disabled=false;btn.textContent='▶ Scan All Devices';} });
+function _fmtAct(b) {
+  if (b > 1048576) return (b/1048576).toFixed(1)+'MB';
+  if (b > 1024) return (b/1024).toFixed(1)+'KB';
+  return b+'B';
 }
 
-// ── Select & scan single device ───────────────────────────────────────────────
-function osintSelectDevice(ip) {
-  // Highlight selected chip
-  document.querySelectorAll('[id^="osint-chip-"]').forEach(el=>{
-    el.style.background='var(--bg3)'; el.style.borderColor='var(--border)';
-  });
-  const chip = document.getElementById('osint-chip-'+ip.replace(/\./g,'-'));
-  if (chip) { chip.style.background='rgba(0,229,255,.07)'; chip.style.borderColor='var(--accent)'; }
+// ── Select device ────────────────────────────────────────────────────────
+function actSelectDevice(ip) {
+  ACT_STATE.currentIP = ip;
+  actRefreshDeviceGrid();
+  actLoadPopup(ip);
+}
 
-  // Use cache if available and fresh
-  const cached = OSINT_STATE.results[ip];
-  if (cached?._ran) { osintShowResult(ip, cached); return; }
+// ── Load popup ───────────────────────────────────────────────────────────
+function actLoadPopup(ip) {
+  const overlay = document.getElementById('act-overlay');
+  const title   = document.getElementById('act-popup-title');
+  const sub     = document.getElementById('act-popup-sub');
 
-  // Show loading state
-  const res = document.getElementById('osint-results');
-  if (res) res.innerHTML = osintLoadingHTML(ip);
-  OSINT_STATE.scanning.add(ip);
-  osintRefreshDeviceGrid();
+  const dev = S.devices[ip] || {};
+  title.textContent = ip;
+  sub.textContent   = `${dev.hostname||''} ${dev.vendor&&dev.vendor!==ip?'· '+dev.vendor:''}`;
+  overlay.style.display = 'flex';
 
-  fetch(`/api/osint/${ip}`).then(r=>r.json()).then(data=>{
-    OSINT_STATE.results[ip] = data;
-    OSINT_STATE.scanning.delete(ip);
-    osintRefreshDeviceGrid();
-    osintShowResult(ip, data);
-  }).catch(e=>{
-    OSINT_STATE.scanning.delete(ip);
-    osintRefreshDeviceGrid();
-    if (res) res.innerHTML = `<div style="color:var(--red);padding:20px">Error: ${e}</div>`;
+  // Reset state
+  ACT_STATE.data = null;
+  ACT_STATE.paused = false;
+  ACT_STATE.protoFilter = null;
+  ACT_STATE._pktBuf = [];
+  ACT_STATE.zoom = 1;
+  ACT_STATE.panX = 0;
+  ACT_STATE.panY = 0;
+  ACT_STATE.selectedIP = null;
+  _actHoverNode = null;
+  _actHideTip();
+  _actCanvasReady = false;
+  _actSetStatus('Capturing traffic...');
+  _actUpdateZoomLabel();
+  _actBindCanvasEvents();
+
+  fetch(`/api/activities/${ip}`).then(r=>r.json()).then(data => {
+    ACT_STATE.data = data;
+    _actBuildGraph(data);
+    _actRenderProtoSidebar(data);
+    _actDrawCanvas();
+    _actSetStatus(`Live — ${data.summary?.total_requests||0} packets · ${data.summary?.unique_destinations||0} hosts`);
+    document.getElementById('act-status-conn').textContent =
+      `${data.connections?.length||0} flows`;
+    _actStartLoop();
+  }).catch(e => {
+    _actSetStatus('Error: ' + e);
   });
 }
 
-function osintLoadingHTML(ip) {
-  return `<div style="text-align:center;padding:40px">
-    <div style="font-size:22px;margin-bottom:12px">🔍</div>
-    <div style="font-size:13px;color:var(--accent)">Querying OSINT databases for ${ip}…</div>
-    <div style="font-size:11px;color:var(--muted);margin-top:6px">
-      Shodan · Censys · AbuseIPDB · AlienVault OTX
-    </div>
-    <div style="margin-top:16px;height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;width:300px;margin-inline:auto">
-      <div style="height:100%;background:linear-gradient(90deg,var(--accent),#7c4dff);
-           animation:slide 1.4s ease-in-out infinite;border-radius:2px"></div>
-    </div>
-  </div>
-  <style>@keyframes slide{0%{width:0%;margin-left:0}50%{width:60%;margin-left:20%}100%{width:0%;margin-left:100%}}</style>`;
+// ── Close popup ──────────────────────────────────────────────────────────
+function actClosePopup() {
+  document.getElementById('act-overlay').style.display = 'none';
+  _actStopLoop();
+  ACT_STATE.currentIP = null;
+  ACT_STATE.data = null;
+  ACT_STATE._pktBuf = [];
+  ACT_STATE.selectedIP = null;
+  _actHoverNode = null;
+  _actHideTip();
+  _actCanvasReady = false;
 }
 
-// ── Render full result ─────────────────────────────────────────────────────────
-function osintShowResult(ip, data) {
-  const tl    = data._threat_level || 'CLEAN';
-  const score = data._threat_score || 0;
-  const dev   = S.devices[ip] || {};
-  const tCol  = THREAT_COL[tl] || 'var(--muted)';
+// ── Refresh all ──────────────────────────────────────────────────────────
+function actRefreshAll() {
+  actRefreshDeviceGrid();
+  if (ACT_STATE.currentIP) actLoadPopup(ACT_STATE.currentIP);
+}
 
-  let html = `
-  <div style="margin-bottom:16px">
-    <!-- Header row -->
-    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px">
-      <div>
-        <div style="font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700;
-                    color:var(--accent)">${ip}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px">
-          ${dev.hostname||''} ${dev.vendor&&dev.vendor!==ip?'· '+dev.vendor:''} ${dev.device_type&&dev.device_type!==ip?'· '+dev.device_type:''}
-        </div>
-      </div>
-      <!-- Threat score gauge -->
-      <div style="margin-left:auto;text-align:center;
-           background:var(--bg3);border:1px solid ${tCol};border-radius:10px;
-           padding:10px 20px;min-width:120px">
-        <div style="font-family:'JetBrains Mono',monospace;font-size:28px;
-                    font-weight:700;color:${tCol}">${score}</div>
-        <div style="font-size:10px;color:var(--muted)">Threat Score</div>
-        <div style="font-size:11px;font-weight:700;color:${tCol};margin-top:2px">${tl}</div>
-      </div>
-      <button class="btn" onclick="osintSelectDevice('${ip}'); fetch('/api/osint/${ip}?refresh=1').then(r=>r.json()).then(d=>{OSINT_STATE.results['${ip}']=d;osintShowResult('${ip}',d);})"
-              style="font-size:10px">↺ Refresh</button>
-    </div>
+// ── Animation loop ───────────────────────────────────────────────────────
+let _actLoopRunning = false;
+function _actStartLoop() {
+  if (_actLoopRunning) return;
+  _actLoopRunning = true;
+  (function tick() {
+    if (!_actLoopRunning) return;
+    if (!ACT_STATE.paused && ACT_STATE._pktBuf.length) _actFlushPackets();
+    _actDrawCanvas();
+    ACT_STATE.animFrame = requestAnimationFrame(tick);
+  })();
+}
+function _actStopLoop() {
+  _actLoopRunning = false;
+  if (ACT_STATE.animFrame) { cancelAnimationFrame(ACT_STATE.animFrame); ACT_STATE.animFrame = null; }
+}
 
-    <!-- 4 source cards grid -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-      ${osintShodanCard(data.shodan||{})}
-      ${osintCensysCard(data.censys||{})}
-      ${osintAbuseCard(data.abuseipdb||{})}
-      ${osintOTXCard(data.otx||{})}
+// ── Flush incoming packet buffer into graph ──────────────────────────────
+function _actFlushPackets() {
+  const buf = ACT_STATE._pktBuf;
+  if (!buf.length) return;
+  const batch = buf.splice(0, 50);
+  batch.forEach(pkt => _actIngestPacket(pkt));
+  _actRenderProtoSidebar(ACT_STATE.data);
+  _actUpdateCanvasInfo();
+  if (ACT_STATE.data) {
+    const sum = ACT_STATE.data.summary || {};
+    _actSetStatus(`Live — ${sum.total_requests||0} packets · ${sum.unique_destinations||0} hosts`);
+  }
+}
+
+// ── Ingest a single live packet into the graph ───────────────────────────
+function _actIngestPacket(pkt) {
+  const ip = ACT_STATE.currentIP;
+  if (!ip) return;
+  if (pkt.src !== ip && pkt.dst !== ip) return;
+  const proto = (pkt.proto||'OTHER').toUpperCase();
+  if (ACT_STATE.protoFilter && proto !== ACT_STATE.protoFilter) return;
+
+  const data = ACT_STATE.data;
+  if (!data) return;
+
+  // Update summary
+  if (!data.summary) data.summary = {};
+  data.summary.total_requests = (data.summary.total_requests||0) + 1;
+  data.summary.total_bytes = (data.summary.total_bytes||0) + (pkt.len||0);
+
+  // Track destination
+  const remote = pkt.src === ip ? pkt.dst : pkt.src;
+  if (!data._seenDests) data._seenDests = new Set();
+  if (!data._seenDests.has(remote)) {
+    data._seenDests.add(remote);
+    data.summary.unique_destinations = (data.summary.unique_destinations||0) + 1;
+  }
+
+  // Add to connections
+  if (!data.connections) data.connections = [];
+  let conn = data.connections.find(c =>
+    ((c.src===pkt.src&&c.dst===pkt.dst)||(c.src===pkt.dst&&c.dst===pkt.src)) && c.proto===proto);
+  if (conn) {
+    conn.count = (conn.count||0) + 1;
+    conn.len = (conn.len||0) + (pkt.len||0);
+    conn.last_ts = pkt.ts;
+  } else {
+    data.connections.push({
+      src: pkt.src, dst: pkt.dst, proto: proto,
+      count: 1, len: pkt.len||0,
+      sport: pkt.sport, dport: pkt.dport,
+      info: pkt.info||'', last_ts: pkt.ts,
+    });
+  }
+
+  // Add to sites
+  if (!data.sites_visited) data.sites_visited = [];
+  let site = data.sites_visited.find(s => s.ip === remote);
+  if (!site) {
+    data.sites_visited.push({ ip: remote, domain: remote, count: 1, last_seen: pkt.ts });
+  } else {
+    site.count = (site.count||0) + 1;
+  }
+
+  // Ensure node exists
+  let node = ACT_STATE.nodes.find(n => n.id === remote);
+  if (!node) {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 0.22 + Math.random() * 0.12;
+    const label = _actIsDomain(site.domain) ? site.domain : remote;
+    node = {
+      id: remote, label,
+      x: 0.5 + Math.cos(angle) * radius,
+      y: 0.5 + Math.sin(angle) * radius,
+      size: 5, color: _actColor(proto), isLocal: false, traffic: 0,
+      activity: 0, _phase: Math.random()*Math.PI*2,
+      host: _actIsDomain(site.domain) ? site.domain : null,
+    };
+    ACT_STATE.nodes.push(node);
+  }
+  node.traffic += (pkt.len||0);
+  node.color = _actColor(proto);
+  node.activity = Math.min(0.9, (node.activity||0) + 0.35);
+  if (!node.host && _actIsDomain(site.domain)) {
+    node.host = site.domain;
+    node.label = site.domain;
+  }
+
+  // Ensure edge exists (per protocol)
+  const key = [pkt.src, pkt.dst].sort().join('→') + '|' + proto;
+  let edge = ACT_STATE.edges.find(e => e._key === key);
+  if (!edge) {
+    edge = { src: pkt.src, dst: pkt.dst, proto: proto, count: 0, bytes: 0,
+             color: _actColor(proto), _key: key, _pulse: 1 };
+    ACT_STATE.edges.push(edge);
+  }
+  edge.count++;
+  edge.bytes += (pkt.len||0);
+  edge._pulse = 1;
+
+  // Resize nodes by traffic (larger than before for readability)
+  const maxTraffic = Math.max(1, ...ACT_STATE.nodes.map(n => n.traffic));
+  ACT_STATE.nodes.forEach(n => {
+    if (!n.isLocal) n.size = Math.max(7, Math.min(26, 7 + (n.traffic / maxTraffic) * 19));
+    else n.size = 26;
+  });
+
+  // Flash packet indicator
+  _actFlashPacket(pkt);
+}
+
+// ── Flash live packet indicator ──────────────────────────────────────────
+function _actFlashPacket(pkt) {
+  const el = document.getElementById('act-pkt-flash');
+  if (!el) return;
+  const proto = (pkt.proto||'?').toUpperCase();
+  el.textContent = `${proto} ${pkt.len||0}B ${pkt.src} → ${pkt.dst}`;
+  el.style.display = 'block';
+  el.style.opacity = '1';
+  clearTimeout(el._hideTimer);
+  el._hideTimer = setTimeout(() => { el.style.opacity='0'; setTimeout(()=>el.style.display='none',300); }, 1500);
+}
+
+// ── Zoom controls ────────────────────────────────────────────────────────
+function actZoomIn() {
+  ACT_STATE.zoom = Math.min(8, ACT_STATE.zoom * 1.3);
+  _actUpdateZoomLabel();
+  _actDrawCanvas();
+}
+function actZoomOut() {
+  ACT_STATE.zoom = Math.max(0.2, ACT_STATE.zoom / 1.3);
+  _actUpdateZoomLabel();
+  _actDrawCanvas();
+}
+function actZoomReset() {
+  ACT_STATE.zoom = 1;
+  ACT_STATE.panX = 0;
+  ACT_STATE.panY = 0;
+  _actUpdateZoomLabel();
+  _actDrawCanvas();
+}
+function _actUpdateZoomLabel() {
+  const el = document.getElementById('act-zoom-label');
+  if (el) el.textContent = Math.round(ACT_STATE.zoom * 100) + '%';
+}
+
+// ── Canvas interaction (pan + wheel zoom) ────────────────────────────────
+let _actCanvasBound = false;
+function _actBindCanvasEvents() {
+  if (_actCanvasBound) return;
+  _actCanvasBound = true;
+  const canvas = document.getElementById('act-canvas');
+  if (!canvas) return;
+
+  canvas.addEventListener('mousedown', e => {
+    const r = canvas.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    const id = _actHitNode(sx, sy);
+    if (id) {
+      // Begin independent node drag
+      const node = ACT_STATE.nodes.find(n => n.id === id);
+      const p = _actScreenToNode(sx, sy);
+      node.forced = true;
+      ACT_STATE._dragNode = { id, ox: p.x - node.x, oy: p.y - node.y };
+      ACT_STATE._dragging = true;
+      ACT_STATE.selectedIP = id;
+      canvas.style.cursor = 'grabbing';
+    } else {
+      // Begin camera pan
+      ACT_STATE._dragNode = null;
+      ACT_STATE._dragging = true;
+      ACT_STATE._dragStartX = e.clientX;
+      ACT_STATE._dragStartY = e.clientY;
+      ACT_STATE._panStartX = ACT_STATE.panX;
+      ACT_STATE._panStartY = ACT_STATE.panY;
+      canvas.style.cursor = 'grabbing';
+    }
+  });
+  window.addEventListener('mousemove', e => {
+    if (!ACT_STATE._dragging) return;
+    const r = canvas.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    if (ACT_STATE._dragNode) {
+      // Move the dragged node independently (world coords normalized to 0..1)
+      const node = ACT_STATE.nodes.find(n => n.id === ACT_STATE._dragNode.id);
+      if (node) {
+        const p = _actScreenToNode(sx, sy);
+        node.x = Math.max(0.05, Math.min(0.95, p.x - ACT_STATE._dragNode.ox));
+        node.y = Math.max(0.05, Math.min(0.95, p.y - ACT_STATE._dragNode.oy));
+      }
+    } else {
+      ACT_STATE.panX = ACT_STATE._panStartX + (e.clientX - ACT_STATE._dragStartX) / ACT_STATE.zoom;
+      ACT_STATE.panY = ACT_STATE._panStartY + (e.clientY - ACT_STATE._dragStartY) / ACT_STATE.zoom;
+    }
+  });
+  window.addEventListener('mouseup', () => {
+    if (ACT_STATE._dragNode) {
+      const node = ACT_STATE.nodes.find(n => n.id === ACT_STATE._dragNode.id);
+      if (node) node.forced = false;
+    }
+    ACT_STATE._dragging = false;
+    ACT_STATE._dragNode = null;
+    canvas.style.cursor = 'grab';
+  });
+
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    ACT_STATE.zoom = Math.max(0.2, Math.min(8, ACT_STATE.zoom * (e.deltaY > 0 ? 0.9 : 1.1)));
+    _actUpdateZoomLabel();
+    _actDrawCanvas();
+  }, { passive: false });
+
+  // Touch pinch
+  let _lastPinchDist = 0;
+  canvas.addEventListener('touchstart', e => {
+    if (e.touches.length === 2) {
+      _lastPinchDist = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+    } else if (e.touches.length === 1) {
+      ACT_STATE._dragging = true;
+      ACT_STATE._dragStartX = e.touches[0].clientX;
+      ACT_STATE._dragStartY = e.touches[0].clientY;
+      ACT_STATE._panStartX = ACT_STATE.panX;
+      ACT_STATE._panStartY = ACT_STATE.panY;
+    }
+  }, { passive: true });
+  canvas.addEventListener('touchmove', e => {
+    if (e.touches.length === 2) {
+      const dist = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+      if (_lastPinchDist > 0) ACT_STATE.zoom = Math.max(0.2, Math.min(8, ACT_STATE.zoom * (dist/_lastPinchDist)));
+      _lastPinchDist = dist;
+      _actUpdateZoomLabel();
+    } else if (e.touches.length === 1 && ACT_STATE._dragging) {
+      ACT_STATE.panX = ACT_STATE._panStartX + (e.touches[0].clientX-ACT_STATE._dragStartX)/ACT_STATE.zoom;
+      ACT_STATE.panY = ACT_STATE._panStartY + (e.touches[0].clientY-ACT_STATE._dragStartY)/ACT_STATE.zoom;
+    }
+  }, { passive: true });
+  canvas.addEventListener('touchend', () => { ACT_STATE._dragging = false; _lastPinchDist = 0; }, { passive: true });
+
+  // Click to select a node
+  canvas.addEventListener('click', e => {
+    if (ACT_STATE._dragging) return;
+    const r = canvas.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    const id = _actHitNode(sx, sy);
+    ACT_STATE.selectedIP = id || null;
+    if (!id) _actHideTip();
+    else _actShowTip(id, sx, sy, true);
+  });
+
+  // Hover tooltip
+  canvas.addEventListener('mousemove', _actOnHoverMove);
+  canvas.addEventListener('mouseleave', () => { _actHoverNode = null; _actHideTip(); });
+  canvas.addEventListener('mousedown', () => { _actHoverNode = null; _actHideTip(); });
+}
+
+// ── Node helpers (enrichment, hit-testing, tooltip) ──────────────────────
+let _actHoverNode = null;
+
+function _actNodeDev(id) {
+  return S.devices[id] || null;
+}
+
+// True if host is a real domain name (not a bare IP address)
+function _actIsDomain(host) {
+  if (!host || typeof host !== 'string') return false;
+  const h = host.toLowerCase();
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return false;   // IPv4
+  if (h.includes(':')) return false;                     // IPv6 / port
+  return h.indexOf('.') > -1;                            // has at least one dot and not an IP
+}
+
+// ── Site favicon loading with cache ──────────────────────────────────────
+const _actFavCache = {};   // host -> Image (or null while loading / on failure)
+function _actFavIcon(host) {
+  if (!host) return null;
+  if (host in _actFavCache) return _actFavCache[host] || null;
+  // Same-origin proxy through the app -> no CORS issues, works offline too
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  _actFavCache[host] = null;   // mark as "loading"
+  img.onload = () => { _actFavCache[host] = img; };
+  img.onerror = () => { _actFavCache[host] = null; };
+  try { img.src = '/favicon/' + encodeURIComponent(host); } catch(e) {}
+  return null;
+}
+
+// Classify an activity node: 'local' (the tracked device), 'network' (LAN), or 'internet' (external)
+function _actNodeKind(n) {
+  if (!n) return 'internet';
+  if (n.isLocal || (ACT_STATE.data && n.id === ACT_STATE.data.ip)) return 'local';
+  if (isLanIp(n.id)) return 'network';
+  // Non-IP labels (domain names) are external → internet
+  return 'internet';
+}
+
+// Choose the icon category for a node.
+// Known LAN devices (in S.devices) get their real device-type icon (PC, Mobile Phone, etc.)
+// so the gateway popup shows connected devices by type, not a generic icon.
+// True internet destinations get a globe (or favicon), unknown LAN peers get a network icon.
+function _actNodeIconCat(n, dev, kind) {
+  if (dev && dev.device_type) {
+    return (TOPO && TOPO.category) ? TOPO.category(dev.device_type, !!dev.is_gateway) : 'unknown';
+  }
+  if (kind === 'internet') return 'internet';
+  if (kind === 'network') return 'network';
+  if (n && n.isLocal && dev) {
+    return (TOPO && TOPO.category) ? TOPO.category(dev.device_type || '', !!dev.is_gateway) : 'unknown';
+  }
+  return 'unknown';
+}
+
+// Convert a node's world position to screen coordinates
+function _actNodeToScreen(nx, ny) {
+  const canvas = document.getElementById('act-canvas');
+  const container = canvas.parentElement;
+  const W = container.clientWidth, H = container.clientHeight;
+  const z = ACT_STATE.zoom, px = ACT_STATE.panX, py = ACT_STATE.panY;
+  const wx = nx * W, wy = ny * H;
+  return {
+    x: W/2 + px*z + (wx - W/2) * z,
+    y: H/2 + py*z + (wy - H/2) * z,
+  };
+}
+
+// Convert a screen position to world node coords (nx, ny in [0,1]-ish)
+function _actScreenToNode(sx, sy) {
+  const canvas = document.getElementById('act-canvas');
+  const container = canvas.parentElement;
+  const W = container.clientWidth, H = container.clientHeight;
+  const z = ACT_STATE.zoom, px = ACT_STATE.panX, py = ACT_STATE.panY;
+  const wx = (sx - (W/2 + px*z)) / z + W/2;
+  const wy = (sy - (H/2 + py*z)) / z + H/2;
+  return { x: wx / W, y: wy / H };
+}
+
+// Hit-test: find the node under a screen point
+function _actHitNode(sx, sy) {
+  const p = _actScreenToNode(sx, sy);
+  const nodes = ACT_STATE.nodes;
+  let best = null, bd = 1e9;
+  for (const n of nodes) {
+    const dx = n.x - p.x, dy = n.y - p.y;
+    const d = dx*dx + dy*dy;
+    const rr = (n.size + 10) * (n.size + 10);
+    if (d < rr && d < bd) { bd = d; best = n.id; }
+  }
+  return best;
+}
+
+function _actOnHoverMove(e) {
+  const canvas = document.getElementById('act-canvas');
+  if (!canvas) return;
+  if (ACT_STATE._dragging) { _actHoverNode = null; _actHideTip(); return; }
+  const r = canvas.getBoundingClientRect();
+  const sx = e.clientX - r.left, sy = e.clientY - r.top;
+  const id = _actHitNode(sx, sy);
+  canvas.style.cursor = id ? 'pointer' : 'grab';
+  if (id !== _actHoverNode) {
+    _actHoverNode = id;
+    canvas.style.cursor = id ? 'pointer' : 'grab';
+    if (id) _actShowTip(id, sx, sy, false);
+    else _actHideTip();
+  }
+}
+
+let _actTipNode = null;
+function _actShowTip(id, sx, sy, stay) {
+  const tip = document.getElementById('act-tip');
+  if (!tip) return;
+  const dev = _actNodeDev(id);
+  const n = (ACT_STATE.nodes||[]).find(x => x.id === id);
+  const col = (dev && dev.is_gateway) ? '#00e5ff' : (n ? n.color : '#00e5ff');
+  const catLabelTrans = {
+    router:'Router/AP', phone:'Mobile Phone', tablet:'Tablet',
+    laptop:'Laptop', desktop:'Desktop PC', server:'Server', tv:'Smart TV',
+    printer:'Printer', camera:'IP Camera', console:'Game Console',
+    vm:'Virtual Machine', iot:'IoT Device', speaker:'Smart Speaker',
+    watch:'Wearable', internet:'Internet (External)', network:'Network Device',
+    unknown:'Unknown'
+  };
+  const kind = _actNodeKind(n);
+  let cat = _actNodeIconCat(n, dev, kind);
+  const catLabel = catLabelTrans[cat] || cat;
+  _actTipNode = id;
+  tip.style.display = 'block';
+  tip.style.left = (sx + 16) + 'px';
+  tip.style.top = (sy + 16) + 'px';
+  const title = (kind === 'internet' && n && n.host) ? n.host : id;
+  tip.innerHTML = `
+    <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:7px">
+      <div style="width:10px;height:10px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col}"></div>
+      <span style="font-weight:700;color:${col};font-size:12px;font-family:'JetBrains Mono',monospace">${title}</span>
+      ${(dev && dev.is_gateway)?'<span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 4px">GATEWAY</span>':''}
     </div>
+    <div style="display:grid;grid-template-columns:90px 1fr;gap:3px 8px;font-size:10px;line-height:1.6">
+      <span style="color:var(--muted)">Type</span><span style="font-weight:600">${catLabel}</span>
+      <span style="color:var(--muted)">Address</span><span style="font-family:'JetBrains Mono',monospace">${id}</span>
+      <span style="color:var(--muted)">Domain</span><span>${(kind==='internet' && n && n.host) || (dev && dev.hostname) || '–'}</span>
+      <span style="color:var(--muted)">Vendor</span><span>${dev && dev.vendor || 'Unknown'}</span>
+      <span style="color:var(--muted)">MAC</span><span style="font-family:'JetBrains Mono',monospace">${dev && dev.mac || '–'}</span>
+      <span style="color:var(--muted)">OS</span><span>${((dev && dev.os)||'Unknown').substring(0,26)}</span>
+      <span style="color:var(--muted)">Status</span><span style="color:${(dev&&dev.status)==='online'?'#00e676':'#3d5068'}">${dev && dev.status || '–'}</span>
+      <span style="color:var(--muted)">Vulns</span><span style="color:${(dev&&(dev.vuln_count||0))>0?'#ff2d55':'#00e676'};font-weight:700">${dev && dev.vuln_count || 0}</span>
+      <span style="color:var(--muted)">↓ Traffic</span><span>${TOPO && TOPO.fmtB ? TOPO.fmtB(dev && dev.bytes_in || 0) : (dev ? dev.bytes_in||0 : 0)}</span>
+      <span style="color:var(--muted)">↑ Traffic</span><span>${TOPO && TOPO.fmtB ? TOPO.fmtB(dev && dev.bytes_out || 0) : (dev ? dev.bytes_out||0 : 0)}</span>
+    </div>
+    <div style="margin-top:7px;font-size:9px;color:var(--muted);border-top:1px solid var(--border);padding-top:6px">
+      Click = pin info  ·  Drag node = move  ·  Drag space = pan  ·  Scroll = zoom
+    </div>`;
+}
+function _actHideTip() {
+  _actTipNode = null;
+  const t = document.getElementById('act-tip');
+  if (t) t.style.display = 'none';
+}
+
+// ── Build graph from initial data ────────────────────────────────────────
+function _actBuildGraph(data) {
+  const ip = data.ip;
+  const conns = data.connections || [];
+  const sites = data.sites_visited || [];
+  const nodeMap = {};
+  nodeMap[ip] = { id: ip, label: ip, x: 0.5, y: 0.5, size: 18, color: '#00e5ff', isLocal: true, traffic: 0, activity: 0, _phase: Math.random()*Math.PI*2 };
+
+  sites.forEach((s, i) => {
+    if (s.ip === ip) return;
+    const angle = (i / Math.max(1, sites.length)) * Math.PI * 2;
+    const radius = 0.28 + Math.random() * 0.08;
+    const host = _actIsDomain(s.domain) ? s.domain : null;
+    nodeMap[s.ip] = {
+      id: s.ip, label: s.domain || s.ip, host,
+      x: 0.5 + Math.cos(angle) * radius, y: 0.5 + Math.sin(angle) * radius,
+      size: Math.max(5, Math.min(14, 4 + Math.sqrt(s.count) * 2)),
+      color: _actColor(s.proto || 'OTHER'), isLocal: false, traffic: s.count,
+      activity: 0, _phase: Math.random()*Math.PI*2,
+    };
+  });
+
+  const edgeMap = {};
+  conns.forEach(c => {
+    const src = c.src === ip ? ip : c.src;
+    const dst = c.dst === ip ? ip : c.dst;
+    if (src === dst) return;
+    if (!nodeMap[src]) nodeMap[src] = { id: src, label: src, x: Math.random(), y: Math.random(), size: 5, color: _actColor(c.proto), isLocal: false, traffic: 0, activity: 0, _phase: Math.random()*Math.PI*2 };
+    if (!nodeMap[dst]) nodeMap[dst] = { id: dst, label: dst, x: Math.random(), y: Math.random(), size: 5, color: _actColor(c.proto), isLocal: false, traffic: 0, activity: 0, _phase: Math.random()*Math.PI*2 };
+    nodeMap[src].traffic += (c.len||0);
+    nodeMap[dst].traffic += (c.len||0);
+    const key = [src, dst].sort().join('→') + '|' + (c.proto||'OTHER').toUpperCase();
+    if (!edgeMap[key]) edgeMap[key] = { src, dst, proto: (c.proto||'OTHER').toUpperCase(), count: 0, bytes: 0, color: _actColor(c.proto), _key: key };
+    edgeMap[key].count++;
+    edgeMap[key].bytes += (c.len||0);
+  });
+
+  ACT_STATE.nodes = Object.values(nodeMap);
+  ACT_STATE.edges = Object.values(edgeMap);
+
+  const maxTraffic = Math.max(1, ...ACT_STATE.nodes.map(n => n.traffic));
+  ACT_STATE.nodes.forEach(n => {
+    if (n.isLocal) n.size = 26;
+    else n.size = Math.max(7, Math.min(26, 7 + (n.traffic / maxTraffic) * 19));
+  });
+  data._seenDests = new Set(sites.map(s => s.ip));
+}
+
+// ── Render protocol sidebar ──────────────────────────────────────────────
+function _actRenderProtoSidebar(data) {
+  const el = document.getElementById('act-proto-list');
+  if (!el) return;
+  const conns = data.connections || [];
+  const protoCounts = {}, protoBytes = {};
+  conns.forEach(c => {
+    const p = c.proto || 'OTHER';
+    protoCounts[p] = (protoCounts[p]||0) + (c.count||1);
+    protoBytes[p] = (protoBytes[p]||0) + (c.len||0);
+  });
+
+  const sorted = Object.entries(protoCounts).sort((a,b)=>b[1]-a[1]);
+  const filter = ACT_STATE.protoFilter;
+
+  let html = `<div onclick="actFilterProto(null)" style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;border-radius:3px;transition:background .15s;
+    background:${!filter?'rgba(0,229,255,.12)':'transparent'};border:1px solid ${!filter?'var(--accent)':'transparent'};margin-bottom:4px"
+    onmouseover="this.style.background='rgba(0,255,255,.08)'" onmouseout="this.style.background='${!filter?'rgba(0,229,255,.12)':'transparent'}'">
+    <div style="font-size:10px;font-weight:700;color:${!filter?'var(--accent)':'#aaa'};flex:1">ALL</div>
   </div>`;
 
-  const el = document.getElementById('osint-results');
-  if (el) el.innerHTML = html;
-}
-
-// ── Source cards ──────────────────────────────────────────────────────────────
-function osintCard(title, icon, ok, errorMsg, bodyHTML) {
-  const statusBadge = ok
-    ? `<span style="font-size:9px;color:var(--green);background:rgba(0,230,118,.1);
-         border:1px solid rgba(0,230,118,.25);padding:1px 6px;border-radius:4px">✓ OK</span>`
-    : `<span style="font-size:9px;color:var(--muted);background:var(--bg);
-         border:1px solid var(--border);padding:1px 6px;border-radius:4px">
-         ${errorMsg||'No data'}</span>`;
-  return `<div style="background:var(--bg3);border:1px solid var(--border);
-              border-radius:10px;padding:14px;overflow:hidden">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-      <span style="font-size:16px">${icon}</span>
-      <span style="font-weight:700;font-size:12px">${title}</span>
-      <span style="margin-left:auto">${statusBadge}</span>
-    </div>
-    ${ok ? bodyHTML : `<div style="color:var(--muted);font-size:11px">${errorMsg||'No data returned.'}</div>`}
-  </div>`;
-}
-
-function kv(k,v){
-  if(!v&&v!==0) return '';
-  return `<div style="display:flex;gap:6px;padding:3px 0;border-bottom:1px solid rgba(26,37,53,.5)">
-    <span style="color:var(--muted);font-size:10px;min-width:90px;flex-shrink:0">${k}</span>
-    <span style="font-size:10px;word-break:break-all">${v}</span>
-  </div>`;
-}
-
-function osintShodanCard(d) {
-  const ok = d.ok;
-  let body = '';
-  if (ok) {
-    const vulns = (d.vulns||[]).slice(0,5);
-    const ports  = (d.ports||[]).join(', ') || '—';
-    body = `
-      ${kv('Org', d.org||d.isp||'')}
-      ${kv('Country', d.country||'')} ${kv('City', d.city||'')}
-      ${kv('ASN', d.asn||'')} ${kv('OS', d.os||'')}
-      ${kv('Open Ports', ports)}
-      ${kv('Last Seen', (d.last_seen||'').substring(0,10))}
-      ${kv('Hostnames', (d.hostnames||[]).join(', '))}
-      ${kv('Tags', (d.tags||[]).join(', '))}
-      ${vulns.length?`<div style="margin-top:8px">
-        <div style="font-size:10px;font-weight:700;color:var(--red);margin-bottom:4px">⚠ CVEs (${(d.vulns||[]).length})</div>
-        ${vulns.map(v=>`<div style="font-family:'JetBrains Mono',monospace;font-size:10px;
-          color:var(--red);background:rgba(255,45,85,.06);border-radius:4px;
-          padding:2px 6px;margin-bottom:2px">${v}</div>`).join('')}
-      </div>`:''}
-      ${(d.banners||[]).length?`<div style="margin-top:8px">
-        <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:4px">Service Banners</div>
-        ${d.banners.map(b=>`<div style="margin-bottom:6px;padding:6px;background:var(--bg);
-          border-radius:6px;border:1px solid var(--border)">
-          <div style="font-size:10px;color:var(--accent)">:${b.port} ${b.product} ${b.version}</div>
-          ${b.banner?`<div style="font-size:9px;color:var(--muted);font-family:'JetBrains Mono',monospace;
-            white-space:pre-wrap;word-break:break-all;max-height:60px;overflow:hidden">${b.banner}</div>`:''}
-        </div>`).join('')}
-      </div>`:''}`;
-  }
-  return osintCard('Shodan', '🔍', ok, d.error, body);
-}
-
-function osintCensysCard(d) {
-  const ok = d.ok;
-  let body = '';
-  if (ok) {
-    body = `
-      ${kv('Org / ASN', (d.org||'')+(d.asn?' ('+d.asn+')':''))}
-      ${kv('Country', d.country||'')} ${kv('City', d.city||'')}
-      ${kv('BGP Prefix', d.bgp||'')}
-      ${kv('Last Seen', (d.last_seen||'').substring(0,10))}
-      ${(d.services||[]).length?`<div style="margin-top:8px">
-        <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:4px">
-          Services (${d.services.length})</div>
-        ${d.services.map(s=>`<div style="display:flex;gap:8px;padding:4px 6px;margin-bottom:3px;
-          background:var(--bg);border-radius:5px;font-size:10px">
-          <span style="color:var(--accent);font-family:'JetBrains Mono',monospace;min-width:50px">:${s.port}</span>
-          <span style="color:var(--muted)">${s.transport}</span>
-          <span style="font-weight:600">${s.service||''}</span>
-          <span style="color:var(--muted)">${s.product||''}</span>
-          ${s.tls_subject?`<span style="color:var(--accent2);font-size:9px;margin-left:auto;
-            overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px"
-            title="${s.tls_subject}">🔒 ${s.tls_subject}</span>`:''}
-        </div>`).join('')}
-      </div>`:''}`;
-  }
-  return osintCard('Censys', '🌐', ok, d.error, body);
-}
-
-function osintAbuseCard(d) {
-  const ok = d.ok;
-  let body = '';
-  if (ok) {
-    const score  = d.abuse_score||0;
-    const sCol   = score>=80?'var(--red)':score>=40?'var(--orange)':score>=10?'var(--yellow)':'var(--green)';
-    body = `
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;
-           padding:8px;background:var(--bg);border-radius:8px">
-        <div style="text-align:center">
-          <div style="font-family:'JetBrains Mono',monospace;font-size:26px;
-               font-weight:700;color:${sCol}">${score}%</div>
-          <div style="font-size:9px;color:var(--muted)">Abuse Score</div>
-        </div>
-        <div style="flex:1">
-          <div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden">
-            <div style="height:100%;width:${score}%;background:${sCol};border-radius:4px;transition:width 1s"></div>
-          </div>
-          <div style="font-size:10px;color:var(--muted);margin-top:4px">
-            ${d.total_reports} reports · ${d.distinct_users} users
-          </div>
-        </div>
+  html += sorted.map(([proto, count]) => {
+    const col = _actColor(proto);
+    const bytes = protoBytes[proto]||0;
+    const isActive = filter === proto;
+    return `<div onclick="actFilterProto('${proto}')" style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;border-radius:3px;transition:background .15s;
+      background:${isActive?'rgba(0,229,255,.12)':'transparent'};border:1px solid ${isActive?col+'44':'transparent'}"
+      onmouseover="this.style.background='rgba(255,255,255,.05)'" onmouseout="this.style.background='${isActive?'rgba(0,229,255,.12)':'transparent'}'">
+      <div style="width:10px;height:10px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col}55;flex-shrink:0"></div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:11px;color:${col};font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${proto}</div>
+        <div style="font-size:9px;color:#555">${_fmtAct(bytes)}</div>
       </div>
-      ${kv('ISP', d.isp||'')} ${kv('Domain', d.domain||'')}
-      ${kv('Country', d.country||'')} ${kv('Usage Type', d.usage_type||'')}
-      ${kv('Last Reported', (d.last_reported||'').substring(0,10))}
-      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
-        ${d.is_tor?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;
-          background:rgba(255,45,85,.1);border:1px solid rgba(255,45,85,.3);color:var(--red)">TOR Exit</span>`:''}
-        ${d.is_whitelisted?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;
-          background:rgba(0,230,118,.1);border:1px solid rgba(0,230,118,.3);color:var(--green)">Whitelisted</span>`:''}
-        ${!d.is_public?`<span style="font-size:9px;padding:2px 7px;border-radius:4px;
-          background:rgba(100,181,246,.1);border:1px solid rgba(100,181,246,.3);color:#64b5f6">Private IP</span>`:''}
-      </div>
-      ${(d.reports||[]).length?`<div style="margin-top:10px">
-        <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:5px">
-          Recent Reports</div>
-        ${d.reports.map(r=>`<div style="padding:6px;background:var(--bg);border-radius:6px;
-          margin-bottom:5px;border-left:2px solid var(--red)">
-          <div style="font-size:9px;color:var(--muted);margin-bottom:2px">${r.reported_at.substring(0,10)}
-            ${(r.categories||[]).map(c=>`<span style="margin-left:4px;padding:1px 5px;
-              border-radius:3px;background:rgba(255,107,53,.1);color:var(--orange);font-size:8px">
-              ${ABUSE_CATS[c]||'Cat '+c}</span>`).join('')}
-          </div>
-          <div style="font-size:10px;color:var(--text)">${r.comment||'(no comment)'}</div>
-        </div>`).join('')}
-      </div>`:''}`;
-  }
-  return osintCard('AbuseIPDB', '🛡', ok, d.error, body);
+      <div style="font-size:10px;color:#666;font-family:'JetBrains Mono',monospace;min-width:24px;text-align:right">${count}</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = html;
 }
 
-function osintOTXCard(d) {
-  const ok = d.ok;
-  let body = '';
-  if (ok) {
-    const pulseCount = d.pulse_count||0;
-    const pCol = pulseCount>10?'var(--red)':pulseCount>3?'var(--orange)':pulseCount>0?'var(--yellow)':'var(--green)';
-    body = `
-      <div style="display:flex;gap:14px;align-items:center;margin-bottom:10px;
-           padding:8px;background:var(--bg);border-radius:8px">
-        <div style="text-align:center">
-          <div style="font-family:'JetBrains Mono',monospace;font-size:26px;
-               font-weight:700;color:${pCol}">${pulseCount}</div>
-          <div style="font-size:9px;color:var(--muted)">Threat Pulses</div>
-        </div>
-        <div>
-          ${kv('Reputation', d.reputation!==undefined?d.reputation:'')}
-          ${kv('Country', d.country||'')} ${kv('City', d.city||'')}
-          ${kv('ASN', d.asn||'')}
-        </div>
-      </div>
-      ${(d.passive_dns||[]).length?`<div style="margin-bottom:10px">
-        <div style="font-size:10px;font-weight:700;color:var(--muted);margin-bottom:4px">Passive DNS</div>
-        ${d.passive_dns.map(p=>`<div style="display:flex;gap:8px;font-size:10px;padding:2px 0;
-          border-bottom:1px solid rgba(26,37,53,.5)">
-          <span style="color:var(--accent);font-family:'JetBrains Mono',monospace">${p.hostname}</span>
-          <span style="color:var(--muted);margin-left:auto">${p.first} → ${p.last}</span>
-        </div>`).join('')}
-      </div>`:''}
-      ${(d.pulses||[]).length?`<div>
-        <div style="font-size:10px;font-weight:700;color:var(--red);margin-bottom:5px">
-          Threat Intelligence Pulses</div>
-        ${d.pulses.map(p=>`<div style="padding:7px;background:var(--bg);border-radius:7px;
-          margin-bottom:5px;border-left:2px solid var(--red)">
-          <div style="font-size:10px;font-weight:600">${p.name}</div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
-            <span style="font-size:9px;color:var(--muted)">${p.created}</span>
-            ${p.adversary?`<span style="font-size:9px;color:var(--orange);padding:1px 5px;
-              border-radius:3px;background:rgba(255,107,53,.1)">👤 ${p.adversary}</span>`:''}
-            ${(p.malware_families||[]).map(m=>`<span style="font-size:9px;color:var(--red);
-              padding:1px 5px;border-radius:3px;background:rgba(255,45,85,.1)">🦠 ${m}</span>`).join('')}
-            ${(p.tags||[]).map(t=>`<span style="font-size:9px;color:var(--muted);padding:1px 5px;
-              border-radius:3px;background:var(--bg3)">#${t}</span>`).join('')}
-          </div>
-        </div>`).join('')}
-      </div>`:''}
-      ${(d.malware||[]).length?`<div style="margin-top:8px">
-        <div style="font-size:10px;font-weight:700;color:var(--red);margin-bottom:4px">
-          Malware Hashes</div>
-        ${d.malware.map(h=>`<div style="font-family:'JetBrains Mono',monospace;font-size:9px;
-          color:var(--muted);padding:2px 0">${h}</div>`).join('')}
-      </div>`:''}`;
-  }
-  return osintCard('AlienVault OTX', '🎯', ok, d.error, body);
+function actFilterProto(proto) {
+  ACT_STATE.protoFilter = proto;
+  if (ACT_STATE.data) _actRenderProtoSidebar(ACT_STATE.data);
+  _actSetStatus(proto ? `Filtered: ${proto}` : 'Live — all protocols');
 }
 
-function osintClearAll() {
-  OSINT_STATE.results = {};
-  OSINT_STATE.scanning.clear();
-  osintRefreshDeviceGrid();
-  const el = document.getElementById('osint-results');
-  if (el) el.innerHTML = `<div style="color:var(--muted);text-align:center;padding:40px;font-size:13px">
-    Results cleared. Click a device or Scan All to query again.</div>`;
+// ── Canvas drawing ───────────────────────────────────────────────────────
+let _actCanvasReady = false;
+let _actFrameCount = 0;
+function _actDrawCanvas() {
+  const canvas = document.getElementById('act-canvas');
+  if (!canvas) return;
+  const container = canvas.parentElement;
+  const W = container.clientWidth;
+  const H = container.clientHeight;
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  _actCanvasReady = true;
+  _actFrameCount++;
+
+  const zoom = ACT_STATE.zoom;
+  const panX = ACT_STATE.panX;
+  const panY = ACT_STATE.panY;
+
+  ctx.fillStyle = '#0a0c10';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid (scales with zoom)
+  ctx.save();
+  ctx.translate(W/2 + panX*zoom, H/2 + panY*zoom);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W/2, -H/2);
+
+  ctx.strokeStyle = 'rgba(255,255,255,.03)';
+  ctx.lineWidth = 0.5 / zoom;
+  for (let x = 0; x < W/zoom + Math.abs(panX)*2; x += 40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H/zoom+Math.abs(panY)*2); ctx.stroke(); }
+  for (let y = 0; y < H/zoom + Math.abs(panY)*2; y += 40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W/zoom+Math.abs(panX)*2,y); ctx.stroke(); }
+
+  const filter = ACT_STATE.protoFilter;
+  const nodes = ACT_STATE.nodes;
+  const edges = ACT_STATE.edges;
+
+  // Filter to only edges matching the protocol filter
+  const visEdges = filter ? edges.filter(e => e.proto === filter) : edges;
+
+  // Only show nodes that have at least one visible edge (or the local device)
+  const visNodeIds = new Set();
+  visNodeIds.add(ACT_STATE.currentIP);
+  visEdges.forEach(e => { visNodeIds.add(e.src); visNodeIds.add(e.dst); });
+  const visNodes = filter ? nodes.filter(n => visNodeIds.has(n.id)) : nodes;
+
+  // Animation time (seconds) drives idle drift + breathing glow
+  const now = performance.now() / 1000;
+
+  // Compute each node's rendered position: base + idle drift (nodes being dragged stay put)
+  const pos = {};
+  visNodes.forEach(n => {
+    const ph = n._phase || (n._phase = Math.random() * Math.PI * 2);
+    const d = n.forced ? 0 : 0.02;   // 0 when user is dragging this node
+    pos[n.id] = {
+      x: n.x + Math.sin(now * 0.7 + ph) * d,
+      y: n.y + Math.cos(now * 0.6 + ph * 1.3) * d,
+    };
+    if (n.activity) n.activity = Math.max(0, n.activity - 0.02);
+  });
+
+  // Edges
+  visEdges.forEach(e => {
+    const srcN = visNodes.find(n => n.id === e.src);
+    const dstN = visNodes.find(n => n.id === e.dst);
+    if (!srcN || !dstN) return;
+    const x1=pos[srcN.id].x*W, y1=pos[srcN.id].y*H, x2=pos[dstN.id].x*W, y2=pos[dstN.id].y*H;
+    const thickness = Math.max(0.8, Math.min(5, Math.sqrt(e.count) * 0.6));
+    const pulse = e._pulse || 0;
+    const lineW = pulse > 0 ? thickness + pulse*2 : thickness;
+
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = e.color + (pulse > 0 ? 'cc' : '88');
+    ctx.lineWidth = lineW;
+    ctx.stroke();
+
+    // Animated packet dot
+    if (pulse > 0.3) {
+      const t = (Date.now() % 800) / 800;
+      const px = x1 + (x2-x1)*t, py = y1 + (y2-y1)*t;
+      ctx.beginPath();
+      ctx.arc(px, py, 3, 0, Math.PI*2);
+      ctx.fillStyle = e.color;
+      ctx.fill();
+    }
+
+    if (e._pulse > 0) e._pulse = Math.max(0, e._pulse - 0.03);
+  });
+
+  // Nodes
+  visNodes.forEach(n => {
+    const x = pos[n.id].x*W, y = pos[n.id].y*H, r = n.size;
+    const activity = n.activity || 0;
+    const breath = 0.5 + 0.5 * Math.sin(now * 2 + (n._phase || 0));
+    const glowR = r * (1.9 + 0.6 * breath + activity * 2.6);
+    const dev = _actNodeDev(n.id);
+    const col = (dev && dev.is_gateway) ? '#00e5ff' : n.color;
+    const kind = _actNodeKind(n);
+
+    // Outer glow (breathing + activity-driven, mirrors overview topology graph)
+    const glowAlpha255 = Math.round(Math.max(0, Math.min(1, 0.28 + 0.22 * breath + activity * 0.5)) * 255);
+    const glowHex = glowAlpha255.toString(16).padStart(2, '0');
+    const grad = ctx.createRadialGradient(x, y, r*0.4, x, y, glowR);
+    grad.addColorStop(0, col + glowHex);
+    grad.addColorStop(1, 'transparent');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(x, y, glowR, 0, Math.PI*2);
+    ctx.fill();
+
+    // Node background circle (subtle scale pulse on activity)
+    ctx.beginPath();
+    ctx.arc(x, y, r * (1 + activity * 0.15), 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(10,14,20,0.93)';
+    ctx.fill();
+
+    // Node border (highlight if hovered, selected, or gateway)
+    const hl = (n.id === _actHoverNode) || (n.id === ACT_STATE.selectedIP);
+    ctx.strokeStyle = hl ? '#fff' : col;
+    ctx.lineWidth = (n.id === ACT_STATE.selectedIP) ? 3 : (hl ? 2.5 : 1.5);
+    ctx.stroke();
+
+    // Selected dashed ring
+    if (n.id === ACT_STATE.selectedIP) {
+      ctx.beginPath(); ctx.arc(x, y, r+8, 0, Math.PI*2);
+      ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 1.5; ctx.setLineDash([5,4]);
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    // Icon inside node
+    ctx.save();
+    ctx.translate(x, y);
+    const isLocal = (kind === 'local');
+    const isKnownDev = !!(dev && dev.device_type);
+    if (isLocal || isKnownDev) {
+      // Local device + known LAN peers keep their real device-type icon
+      let cat = _actNodeIconCat(n, dev, kind);
+      if (TOPO && TOPO.drawIcon) TOPO.drawIcon(cat, r*0.8, col, ctx);
+      // Overlay favicon on top of the device icon for known LAN devices that are internet sites
+      const fav = (kind === 'internet' && n.host) ? _actFavIcon(n.host) : null;
+      if (fav) {
+        const fs = r*0.5, fr = r*0.54;
+        ctx.beginPath(); ctx.arc(0,0,fr,0,Math.PI*2); ctx.clip();
+        ctx.drawImage(fav, -fs/2, -fs/2, fs, fs);
+        ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = Math.max(1, r*0.06);
+        ctx.beginPath(); ctx.arc(0,0,fr,0,Math.PI*2); ctx.stroke();
+      }
+    } else {
+      // Remote site / unknown peer -> bold server icon, favicon overlaid on top
+      if (TOPO && TOPO.drawIcon) {
+        ctx.lineWidth = Math.max(2.5, r*0.16);   // thicker stroke for a bold icon
+        TOPO.drawIcon('server', r*0.86, col, ctx);
+        ctx.lineWidth = Math.max(2.5, r*0.16);
+      }
+      const fav = (kind === 'internet' && n.host) ? _actFavIcon(n.host) : null;
+      if (fav) {
+        const fs = r*0.58, fr = r*0.55;
+        ctx.beginPath(); ctx.arc(0,0,fr,0,Math.PI*2); ctx.clip();
+        ctx.drawImage(fav, -fs/2, -fs/2, fs, fs);
+        ctx.strokeStyle = 'rgba(255,255,255,.9)'; ctx.lineWidth = Math.max(1.5, r*0.09);
+        ctx.beginPath(); ctx.arc(0,0,fr,0,Math.PI*2); ctx.stroke();
+      }
+    }
+    ctx.restore();
+
+    // Label below node: domain name for sites, else IP; local device keeps IP
+    const fontSize = Math.max(8, Math.min(11, r * 0.40));
+    const label = n.host || n.label || n.id;
+    ctx.font = `bold ${n.isLocal?fontSize+1:fontSize}px "JetBrains Mono", monospace`;
+    ctx.fillStyle = col;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(label, x, y + r + 6);
+  });
+
+  // Title
+  if (ACT_STATE.data) {
+    ctx.fillStyle = 'rgba(255,255,255,.15)';
+    ctx.font = 'bold 14px "Segoe UI", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Network Graph — ${ACT_STATE.data.ip}`, W/2, 20);
+  }
+
+  ctx.restore();
+  _actUpdateCanvasInfo();
+}
+
+function _actUpdateCanvasInfo() {
+  const el = document.getElementById('act-canvas-info');
+  if (!el || !ACT_STATE.data) return;
+  const sum = ACT_STATE.data.summary || {};
+  const filter = ACT_STATE.protoFilter;
+  const fEdges = filter ? ACT_STATE.edges.filter(e=>e.proto===filter) : ACT_STATE.edges;
+  const fPkts = fEdges.reduce((s,e)=>s+(e.count||0),0);
+  const fBytes = fEdges.reduce((s,e)=>s+(e.bytes||0),0);
+  const fHosts = new Set(); fEdges.forEach(e=>{fHosts.add(e.src);fHosts.add(e.dst)});
+  el.style.display = 'block';
+  el.innerHTML = `
+    <div style="margin-bottom:4px;font-weight:600;color:#fff">${ACT_STATE.data.ip}</div>
+    ${filter?`<div style="margin-bottom:4px;color:var(--accent);font-size:9px">Filtered: ${filter}</div>`:''}
+    <div>Packets: <span style="color:#00e5ff">${fPkts}</span></div>
+    <div>Bytes: <span style="color:#00e676">${_fmtAct(fBytes)}</span></div>
+    <div>Hosts: <span style="color:#ff6b35">${fHosts.size}</span></div>
+    <div>Edges: <span style="color:#7c4dff">${fEdges.length}</span></div>
+    <div style="margin-top:4px;color:#666">Zoom: ${Math.round(ACT_STATE.zoom*100)}%</div>
+  `;
+}
+
+// ── Toolbar actions ──────────────────────────────────────────────────────
+function actToolbarAction(action) {
+  if (action === 'pause') {
+    ACT_STATE.paused = !ACT_STATE.paused;
+    _actSetStatus(ACT_STATE.paused ? 'Paused' : 'Live');
+  } else if (action === 'stop') {
+    ACT_STATE.paused = true;
+    _actSetStatus('Stopped');
+  } else if (action === 'start') {
+    ACT_STATE.paused = false;
+    ACT_STATE._pktBuf = [];
+    _actSetStatus('Live');
+    if (ACT_STATE.currentIP) actLoadPopup(ACT_STATE.currentIP);
+  } else if (action === 'next') {
+    if (ACT_STATE.currentIP) actLoadPopup(ACT_STATE.currentIP);
+  } else if (action === 'nodes') {
+    const info = document.getElementById('act-canvas-info');
+    if (info) info.style.display = info.style.display === 'none' ? 'block' : 'none';
+  }
+}
+
+function _actSetStatus(txt) {
+  const el = document.getElementById('act-status-text');
+  if (el) el.textContent = txt;
+}
+
+// ── Init on nav ──────────────────────────────────────────────────────────
+function actInit() {
+  actRefreshDeviceGrid();
 }
 
 // Refresh device grid when devices panel updates
 socket.on("device_update", () => {
-  if (active("osint")) osintRefreshDeviceGrid();
+  if (active("activities")) actRefreshDeviceGrid();
+});
+
+// ── Real-time packet feed ────────────────────────────────────────────────
+socket.on("live_packet", pkt => {
+  if (!ACT_STATE.currentIP || ACT_STATE.paused) return;
+  if (pkt.src === ACT_STATE.currentIP || pkt.dst === ACT_STATE.currentIP) {
+    ACT_STATE._pktBuf.push(pkt);
+    if (ACT_STATE._pktBuf.length > 500) ACT_STATE._pktBuf.splice(0, 100);
+  }
 });
 
 // Clock
