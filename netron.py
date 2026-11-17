@@ -1,45 +1,27 @@
 #!/usr/bin/env python3
 """
-NetSentinel v3.0 - Advanced Network Management & Security Dashboard
+Netron v3.0 - Advanced Network Management & Security Dashboard
 
 Install:
     pip install scapy psutil netifaces requests flask flask-socketio python-nmap
 
 Run:
-    sudo python3 network_manager.py        # full features
-    python3 network_manager.py             # limited (no raw capture)
+    sudo python3 netron.py        # full features
+    python3 netron.py             # limited (no raw capture)
 
-Open http://localhost:5000 in your browser.
+Open http://localhost:5000 in your browser (override with the
+NETRON_HOST / NETRON_PORT environment variables).
 """
 
-import os, sys, re, time, socket, threading, subprocess, ipaddress
+import functools, os, secrets, sys, re, time, socket, threading, subprocess, ipaddress
 import hashlib, logging, platform
 from datetime import datetime
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Root detection (safe on Windows too) ──────────────────────────────────────
 IS_ROOT = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
-
-# ── .env loader (no python-dotenv dependency needed) ─────────────────────────
-def _load_env(path: str = ".env") -> None:
-    """Parse a simple KEY=VALUE .env file into os.environ."""
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key = key.strip()
-                val = val.strip().strip('"').strip("'")
-                if key and key not in os.environ:
-                    os.environ[key] = val
-    except FileNotFoundError:
-        pass   # .env is optional
-
-_load_env()   # load before reading keys below
 
 # ── Third-party imports ───────────────────────────────────────────────────────
 try:
@@ -73,13 +55,13 @@ logging.getLogger("scapy.loading").setLevel(logging.CRITICAL)
 try:
     import scapy.config
     scapy.config.conf.verb = 0          # suppress scapy output
-    from scapy.all import sniff, ARP, Ether, IP, TCP, UDP, ICMP, DNS, DNSQR, srp
+    from scapy.all import sniff, ARP, Ether, IP, IPv6, TCP, UDP, ICMP, DNS, DNSQR, srp
     SCAPY_OK = True
 except Exception:
     SCAPY_OK = False
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
-log = logging.getLogger("netsentry")
+log = logging.getLogger("netron")
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 logging.getLogger("engineio").setLevel(logging.ERROR)
 logging.getLogger("socketio").setLevel(logging.ERROR)
@@ -87,11 +69,14 @@ logging.getLogger("socketio").setLevel(logging.ERROR)
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-VERSION        = "3.0.0"
-APP_PORT       = 5000
+VERSION        = "3.0.1"
+APP_HOST       = os.environ.get("NETRON_HOST", "0.0.0.0")
+APP_PORT       = int(os.environ.get("NETRON_PORT", "5000"))
 SCAN_INTERVAL  = 15          # seconds between full sweeps (fast for quick detection)
 MAX_PKTS       = 400         # per-device packet log size
 ANOMALY_THRESH = 50          # SYN packets before flood alert
+ARP_GRACE_SECS = 90          # keep a device "online" this long after its last ARP sighting
+EMIT_RATE_PPS  = 25          # max live_packet/topo_packet socket events per second
 
 VULNERABLE_PORTS = {
     21:   ("FTP",          "MEDIUM",   "Unencrypted file transfer – credentials in plaintext"),
@@ -246,19 +231,19 @@ OUI_TABLE: Dict[str, Tuple[str,str,str]] = {
     "00:1E:0B":("HP","PC","HP"),     "00:21:5A":("HP","PC","HP"),
     "00:23:7D":("HP","PC","HP"),     "00:24:81":("HP","PC","HP"),
     "00:25:B3":("HP","Printer","HP"),"30:8D:99":("HP","Printer","HP"),
-    "3C:D9:2B":("HP","PC","HP"),     "3C:D9:2B":("HP","PC","HP"),
+    "3C:D9:2B":("HP","PC","HP"),
     "A0:D3:C1":("HP","PC","HP"),     "68:B5:99":("HP","PC","HP"),
     "70:5A:0F":("HP","PC","HP"),     "84:34:97":("HP","PC","HP"),
     "94:57:A5":("HP","PC","HP"),     "9C:B6:54":("HP","PC","HP"),
     # ── Lenovo ─────────────────────────────────────────────────────────────
     "00:21:CC":("Lenovo","Laptop","Lenovo"),  "00:26:C6":("Lenovo","Laptop","Lenovo"),
-    "28:D2:44":("Lenovo","Laptop","Lenovo"),  "40:2C:F4":("Lenovo","Laptop","Lenovo"),
+    "28:D2:44":("LCFC (Lenovo)","Laptop","Lenovo"),  "40:2C:F4":("Lenovo","Laptop","Lenovo"),
     "44:37:E6":("Lenovo","Laptop","Lenovo"),  "54:05:DB":("Lenovo","Laptop","Lenovo"),
-    "60:02:B4":("Lenovo","Laptop","Lenovo"),  "6C:88:14":("Lenovo","Laptop","Lenovo"),
+    "60:02:B4":("Lenovo","Laptop","Lenovo"),
     "70:5A:B6":("Lenovo","Laptop","Lenovo"),  "74:DF:BF":("Lenovo","Laptop","Lenovo"),
     "84:7A:88":("Lenovo","Laptop","Lenovo"),  "88:79:7E":("Lenovo","Laptop","Lenovo"),
-    "8C:8D:28":("Lenovo","Laptop","Lenovo"),  "98:FA:9B":("Lenovo","Laptop","Lenovo"),
-    "A4:4C:C8":("Lenovo","Laptop","Lenovo"),  "AC:B5:7D":("Lenovo","Laptop","Lenovo"),
+    "98:FA:9B":("Lenovo","Laptop","Lenovo"),
+    "A4:4C:C8":("Dell","PC","Dell"),
     "B8:AC:6F":("Lenovo","Laptop","Lenovo"),  "C8:5B:76":("Lenovo","Laptop","Lenovo"),
     "D4:81:D7":("Lenovo","Laptop","Lenovo"),  "E8:39:DF":("Lenovo","Laptop","Lenovo"),
     # ── Asus ────────────────────────────────────────────────────────────────
@@ -285,9 +270,9 @@ OUI_TABLE: Dict[str, Tuple[str,str,str]] = {
     "00:0D:28":("Cisco","Router/AP","Cisco"), "00:0E:38":("Cisco","Router/AP","Cisco"),
     "00:0F:8F":("Cisco","Router/AP","Cisco"), "00:1A:2B":("Cisco","Router/AP","Cisco"),
     "00:1A:6D":("Cisco","Router/AP","Cisco"), "00:1B:D5":("Cisco","Router/AP","Cisco"),
-    "58:AC:78":("Cisco","Router/AP","Cisco"), "00:50:56":("VMware","Virtual Machine","VMware"),
+    "58:AC:78":("Cisco","Router/AP","Cisco"),
     # ── TP-Link ─────────────────────────────────────────────────────────────
-    "00:24:D7":("TP-Link","Router/AP","TP-Link"), "00:18:0A":("TP-Link","Router/AP","TP-Link"),
+    "00:18:0A":("TP-Link","Router/AP","TP-Link"),
     "AC:84:C6":("TP-Link","Router/AP","TP-Link"), "50:C7:BF":("TP-Link","Router/AP","TP-Link"),
     "00:1D:0F":("TP-Link","Router/AP","TP-Link"), "14:CC:20":("TP-Link","Router/AP","TP-Link"),
     "18:A6:F7":("TP-Link","Router/AP","TP-Link"), "1C:3B:F3":("TP-Link","Router/AP","TP-Link"),
@@ -295,19 +280,19 @@ OUI_TABLE: Dict[str, Tuple[str,str,str]] = {
     "28:87:BA":("TP-Link","Router/AP","TP-Link"), "2C:D0:5A":("TP-Link","Router/AP","TP-Link"),
     "30:B5:C2":("TP-Link","Router/AP","TP-Link"), "34:60:F9":("TP-Link","Router/AP","TP-Link"),
     "38:EA:A7":("TP-Link","Router/AP","TP-Link"), "3C:84:6A":("TP-Link","Router/AP","TP-Link"),
-    "40:3F:8C":("TP-Link","Router/AP","TP-Link"), "40:8D:5C":("TP-Link","Router/AP","TP-Link"),
-    "44:94:FC":("TP-Link","Router/AP","TP-Link"), "48:8D:36":("TP-Link","Router/AP","TP-Link"),
+    "40:3F:8C":("TP-Link","Router/AP","TP-Link"), "40:8D:5C":("GIGA-BYTE","PC","GIGA-BYTE"),
+    "48:8D:36":("TP-Link","Router/AP","TP-Link"),
     "50:3E:AA":("TP-Link","Router/AP","TP-Link"), "54:E6:FC":("TP-Link","Router/AP","TP-Link"),
     "58:D5:6E":("TP-Link","Router/AP","TP-Link"), "5C:63:BF":("TP-Link","Router/AP","TP-Link"),
     "60:32:B1":("TP-Link","Router/AP","TP-Link"), "64:70:02":("TP-Link","Router/AP","TP-Link"),
-    "6C:B0:CE":("TP-Link","Router/AP","TP-Link"), "70:4F:57":("TP-Link","Router/AP","TP-Link"),
+    "70:4F:57":("TP-Link","Router/AP","TP-Link"),
     "74:DA:88":("TP-Link","Router/AP","TP-Link"), "7C:8B:CA":("TP-Link","Router/AP","TP-Link"),
     "80:35:C1":("TP-Link","Router/AP","TP-Link"), "84:16:F9":("TP-Link","Router/AP","TP-Link"),
     "8C:21:0A":("TP-Link","Router/AP","TP-Link"), "90:F6:52":("TP-Link","Router/AP","TP-Link"),
     "94:D9:B3":("TP-Link","Router/AP","TP-Link"), "98:DE:D0":("TP-Link","Router/AP","TP-Link"),
     "9C:A6:15":("TP-Link","Router/AP","TP-Link"), "A0:F3:C1":("TP-Link","Router/AP","TP-Link"),
     "A4:2B:B0":("TP-Link","Router/AP","TP-Link"), "A8:57:4E":("TP-Link","Router/AP","TP-Link"),
-    "AC:9E:17":("TP-Link","Router/AP","TP-Link"), "B0:48:7A":("TP-Link","Router/AP","TP-Link"),
+    "B0:48:7A":("TP-Link","Router/AP","TP-Link"),
     "B8:08:CF":("TP-Link","Router/AP","TP-Link"), "BC:46:99":("TP-Link","Router/AP","TP-Link"),
     "C0:4A:00":("TP-Link","Router/AP","TP-Link"), "C4:6E:1F":("TP-Link","Router/AP","TP-Link"),
     "C8:D3:A3":("TP-Link","Router/AP","TP-Link"), "CC:32:E5":("TP-Link","Router/AP","TP-Link"),
@@ -339,7 +324,7 @@ OUI_TABLE: Dict[str, Tuple[str,str,str]] = {
     "B0:4E:26":("Google","Chromecast","Google"),  "54:60:09":("Google","Chromecast","Google"),
     "6C:AD:F8":("Google","Chromecast","Google"),  "AA:01:37":("Google","Chromecast","Google"),
     "18:B4:30":("Nest","Smart Home","Google"),    "20:7B:D2":("Google","Google Home","Google"),
-    "3C:28:6D":("Google","Pixel Phone","Google"), "CC:3D:82":("Google","Pixel Phone","Google"),
+    "3C:28:6D":("Google","Pixel Phone","Google"),
     "D0:E7:82":("Google","Pixel Phone","Google"), "F4:F5:D8":("Google","Pixel Phone","Google"),
     # ── Amazon ──────────────────────────────────────────────────────────────
     "F0:27:65":("Amazon","Echo","Amazon"),  "44:65:0D":("Amazon","Echo","Amazon"),
@@ -367,20 +352,21 @@ OUI_TABLE: Dict[str, Tuple[str,str,str]] = {
     # ── Intel (PC NICs) ─────────────────────────────────────────────────────
     "00:1B:21":("Intel","PC","Intel"),  "00:1F:3B":("Intel","PC","Intel"),
     "00:22:FB":("Intel","PC","Intel"),  "00:24:D7":("Intel","PC","Intel"),
-    "10:02:B5":("Intel","PC","Intel"),  "18:03:73":("Intel","PC","Intel"),
+    "10:02:B5":("Intel","PC","Intel"),
     "1C:69:7A":("Intel","PC","Intel"),  "24:77:03":("Intel","PC","Intel"),
-    "28:D2:44":("Intel","PC","Intel"),  "34:13:E8":("Intel","PC","Intel"),
-    "40:8D:5C":("Intel","PC","Intel"),  "4C:EB:42":("Intel","PC","Intel"),
+    "34:13:E8":("Intel","PC","Intel"),
+    "4C:EB:42":("Intel","PC","Intel"),
     "50:7B:9D":("Intel","PC","Intel"),  "54:27:1E":("Intel","PC","Intel"),
     "6C:88:14":("Intel","PC","Intel"),  "7C:67:A2":("Intel","PC","Intel"),
     "80:86:F2":("Intel","PC","Intel"),  "8C:8D:28":("Intel","PC","Intel"),
     "94:65:9C":("Intel","PC","Intel"),  "A0:A8:CD":("Intel","PC","Intel"),
-    "A4:4C:C8":("Intel","PC","Intel"),  "AC:B5:7D":("Intel","PC","Intel"),
     "B8:03:05":("Intel","PC","Intel"),  "C0:3F:D5":("Intel","PC","Intel"),
     "C4:65:16":("Intel","PC","Intel"),  "CC:3D:82":("Intel","PC","Intel"),
     "D0:50:99":("Intel","PC","Intel"),  "D4:BE:D9":("Intel","PC","Intel"),
     "E0:94:67":("Intel","PC","Intel"),  "E4:B3:18":("Intel","PC","Intel"),
     "E8:6A:64":("Intel","PC","Intel"),  "EC:F4:BB":("Intel","PC","Intel"),
+    # ── Liteon (PC NICs / optical) ──────────────────────────────────────────
+    "AC:B5:7D":("Liteon","PC","Liteon"),
     # ── IP Cameras / NVR ────────────────────────────────────────────────────
     "00:12:12":("Hikvision","IP Camera","Hikvision"), "BC:AD:28":("Hikvision","IP Camera","Hikvision"),
     "C0:56:E3":("Hikvision","IP Camera","Hikvision"), "44:19:B6":("Hikvision","IP Camera","Hikvision"),
@@ -479,6 +465,11 @@ alerts:       deque                     = deque(maxlen=200)
 syn_counters: Dict[str, int]            = defaultdict(int)
 net_stats = dict(total_in=0, total_out=0, pps=0, scan_count=0, alert_count=0)
 _lock = threading.RLock()
+# Consecutive sweeps in which a device was NOT seen by nmap (device is only
+# flipped to offline when this reaches 2 AND the ARP grace period has passed).
+missed_scans: Dict[str, int]  = defaultdict(int)
+# Last time each IP was present in the OS ARP table (unix seconds).
+_arp_seen_ts: Dict[str, float] = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  UTILITY FUNCTIONS
@@ -515,6 +506,14 @@ def get_local_ips() -> set:
         pass
     return ips
 
+def _primary_local_ip() -> str:
+    """Best-effort primary LAN IPv4 (never loopback). Re-resolved on each call
+    so DHCP/VPN changes are picked up."""
+    try:
+        return next(iter(get_local_ips() - {"127.0.0.1"}), "0.0.0.0")
+    except Exception:
+        return "0.0.0.0"
+
 def oui(mac: str) -> str:
     if not mac or mac in ("N/A", ""):
         return ""
@@ -523,23 +522,41 @@ def oui(mac: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 #  VENDOR LOOKUP  – 4-source cascade, thread-safe, fully cached
 # ─────────────────────────────────────────────────────────────────────────────
-_vendor_cache:    Dict[str, Tuple[str,str,str]] = {}   # OUI prefix → (vendor, dtype, brand)
-_hostname_cache:  Dict[str, str]                = {}   # IP → hostname (PTR)
-_banner_cache:    Dict[str, str]                = {}   # IP → HTTP banner info
-_mdns_cache:      Dict[str, str]                = {}   # IP → mDNS/Bonjour name
+_vendor_cache:  Dict[str, Tuple[str,str,str]] = {}   # OUI prefix → (vendor, dtype, brand)
+_vendor_fail_ts: Dict[str, float]      = {}   # OUI prefix → time of last failed lookup
+_VENDOR_RETRY_SECS   = 3600            # wait 1 h before retrying a failed lookup
+_VENDOR_MIN_INTERVAL = 1.0             # macvendors.com free tier: 1 request/second
+_vendor_rate_lock    = threading.Lock()
+_last_vendor_query   = 0.0
 
-# Clean company name – strip legal suffixes that clutter the UI
+def _vendor_rate_limit() -> None:
+    """Block until the vendor-API rate limit allows another request."""
+    global _last_vendor_query
+    with _vendor_rate_lock:
+        wait = _last_vendor_query + _VENDOR_MIN_INTERVAL - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_vendor_query = time.time()
+
+# Clean company name – strip legal suffixes that clutter the UI.
+# A suffix is only stripped when preceded by a comma or whitespace, so a
+# company actually NAMED e.g. "Networks" survives intact.
 _CORP_RE = re.compile(
-    r",?\s*(Inc\.?|LLC\.?|Ltd\.?|Co\.?|Corp\.?|GmbH|S\.A\.?|B\.V\.?|PTE\.?|"
+    r"(?:,\s*|\s+)(?:Inc\.?|LLC\.?|Ltd\.?|Co\.?|Corp\.?|GmbH|S\.A\.?|B\.V\.?|PTE\.?|"
     r"Technology|Technologies|Communications|Electronics|International|"
-    r"Solutions|Systems|Networks|Network|Group|Holdings|Manufacturing)\.?$",
+    r"Solutions|Systems|Networks|Group|Holdings|Manufacturing)\.?$",
     re.I
 )
 def _clean_company(name: str) -> str:
     if not name:
         return name
-    name = _CORP_RE.sub("", name).strip(" ,.")
-    return name if name else name   # keep original if cleaning made it empty
+    cleaned = name
+    for _ in range(3):   # strip stacked suffixes, e.g. "... Technologies Inc."
+        new = _CORP_RE.sub("", cleaned).strip(" ,.")
+        if not new or new == cleaned:
+            break
+        cleaned = new
+    return cleaned if cleaned else name   # keep original if cleaning made it empty
 
 # API endpoints tried in order – all return company name from MAC/OUI prefix
 _OUI_API_ENDPOINTS = [
@@ -556,6 +573,7 @@ def _query_oui_api(mac: str, prefix: str) -> Tuple[str,str,str]:
     for tpl in _OUI_API_ENDPOINTS:
         url = tpl.format(mac=mac, prefix=prefix)
         try:
+            _vendor_rate_limit()   # respect the free-tier 1 req/s limit
             r = _http.get(url, timeout=3)
             if r.status_code != 200:
                 continue
@@ -583,7 +601,8 @@ def lookup_vendor(mac: str) -> Tuple[str,str,str]:
       2. Built-in OUI_TABLE (instant, 300+ brands)
       3. macvendors.com  (fast REST API, plain-text response)
       4. maclookup.app   (JSON REST API, fallback)
-    Result is always cached so each OUI prefix is only queried once.
+    Results are cached. A failed lookup is retried only after
+    _VENDOR_RETRY_SECS so offline hosts don't hammer the free APIs.
     """
     prefix = oui(mac)
     if not prefix:
@@ -596,9 +615,15 @@ def lookup_vendor(mac: str) -> Tuple[str,str,str]:
         entry = OUI_TABLE[prefix]
         _vendor_cache[prefix] = entry
         return entry
+    # Recent failure → serve "Unknown" until the retry window has passed
+    fail_ts = _vendor_fail_ts.get(prefix)
+    if fail_ts is not None and (time.time() - fail_ts) < _VENDOR_RETRY_SECS:
+        return ("Unknown","Unknown","Unknown")
     # Live API cascade
     result = _query_oui_api(mac, prefix)
     _vendor_cache[prefix] = result
+    if result[0] == "Unknown":
+        _vendor_fail_ts[prefix] = time.time()
     return result
 
 def _guess_type(v: str) -> str:
@@ -827,7 +852,7 @@ class NetworkScanner:
                 result = fn(network)
                 if result:
                     if self._strategy != name:
-                        print(f"[NetSentinel] Discovery via '{name}' → {len(result)} hosts")
+                        print(f"[Netron] Discovery via '{name}' → {len(result)} hosts")
                         self._strategy = name
                     return result
             except Exception:
@@ -882,21 +907,30 @@ class NetworkScanner:
             except Exception:
                 pass
 
-        # Cross-platform arp -a
-        if not found:
-            try:
-                out = subprocess.check_output(
-                    ["arp", "-a"], stderr=subprocess.DEVNULL, timeout=8
-                ).decode(errors="ignore")
-                for line in out.splitlines():
-                    m = re.search(
-                        r"\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+([0-9a-fA-F:]{17})", line)
-                    if m:
-                        ip_s, mac = m.group(1), m.group(2).upper()
-                        if _in_net(ip_s):
-                            found[ip_s] = {"ip": ip_s, "mac": mac}
-            except Exception:
-                pass
+        # Cross-platform arp -a (only if /proc/net/arp didn't exist or found nothing)
+        try:
+            out = subprocess.check_output(
+                ["arp", "-a"], stderr=subprocess.DEVNULL, timeout=8
+            ).decode(errors="ignore")
+            for line in out.splitlines():
+                # Linux/BSD: "? (192.168.1.10) at aa:bb:cc:dd:ee:ff [ether] on eth0"
+                m = re.search(
+                    r"\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+([0-9a-fA-F:]{17})", line)
+                if not m:
+                    # Windows: " 192.168.1.10        aa-bb-cc-dd-ee-ff     dynamic"
+                    m = re.match(
+                        r"\s*(\d{1,3}(?:\.\d{1,3}){3})\s+"
+                        r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", line)
+                if m:
+                    ip_s = m.group(1)
+                    mac  = m.group(2).replace("-", ":").upper()
+                    # Skip incomplete entries (00:…:00 / ff:ff:ff:ff:ff:ff)
+                    if mac in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+                        continue
+                    if _in_net(ip_s):
+                        found[ip_s] = {"ip": ip_s, "mac": mac}
+        except Exception:
+            pass
 
         return list(found.values())
 
@@ -906,7 +940,7 @@ class NetworkScanner:
         """Returns {port: {state, service, version, protocol}}"""
         if not self.nm:
             return self._tcp_fallback(ip)
-        ports = "21-25,53,80,110,135,139,143,161,389,443,445,512-514,1433,1521,3306,3389,5432,5900,6379,8080,8443,9200,27017"
+        ports = "21-25,53,80,110,135,139,143,161,389,443,445,512-514,548,1433,1521,3306,3389,5432,5555,5900,62078,6379,8080,8443,9200,27017"
         args  = ("-sV --host-timeout 12s -T5" if IS_ROOT
                  else "-sT --host-timeout 12s -T5")
         try:
@@ -983,11 +1017,12 @@ class NetworkScanner:
     # ── TTL ping ──────────────────────────────────────────────────────────────
 
     def ping_ttl(self, ip: str) -> int:
-        flag = ["-n","1"] if platform.system().lower()=="windows" else ["-c","1"]
+        windows = platform.system().lower() == "windows"
+        cmd = ["ping", "-n", "1"] if windows else ["ping", "-c", "1", "-W", "1"]
+        cmd.append(ip)
         try:
             out = subprocess.check_output(
-                ["ping"] + flag + ["-W","1", "-c","1", ip],
-                stderr=subprocess.DEVNULL, timeout=2
+                cmd, stderr=subprocess.DEVNULL, timeout=2
             ).decode(errors="ignore")
             m = re.search(r"ttl[= ](\d+)", out, re.I)
             return int(m.group(1)) if m else 0
@@ -1034,15 +1069,55 @@ class NetworkScanner:
 # ─────────────────────────────────────────────────────────────────────────────
 #  PACKET CAPTURE  (Scapy when root, psutil always)
 # ─────────────────────────────────────────────────────────────────────────────
+# Well-known ports → application protocol label. This is PORT-BASED
+# identification only (no payload inspection) – it's a best-effort hint for
+# the traffic view, not a guarantee.
+_APP_PORTS = {
+    # TCP services
+    (20,  "tcp"): "FTP-DATA",   (21,  "tcp"): "FTP",
+    (22,  "tcp"): "SSH",        (23,  "tcp"): "Telnet",
+    (25,  "tcp"): "SMTP",       (53,  "tcp"): "DNS",
+    (80,  "tcp"): "HTTP",       (110, "tcp"): "POP3",
+    (143, "tcp"): "IMAP",       (443, "tcp"): "TLS/HTTPS",
+    (465, "tcp"): "SMTPS",      (587, "tcp"): "SMTP",
+    (993, "tcp"): "IMAPS",      (995, "tcp"): "POP3S",
+    (1433,"tcp"): "MSSQL",      (1521,"tcp"): "Oracle",
+    (3306,"tcp"): "MySQL",      (3389,"tcp"): "RDP",
+    (5432,"tcp"): "PostgreSQL", (5900,"tcp"): "VNC",
+    (6379,"tcp"): "Redis",      (8080,"tcp"): "HTTP",
+    (8443,"tcp"): "HTTPS",      (9200,"tcp"): "Elasticsearch",
+    (27017,"tcp"): "MongoDB",
+    # UDP services
+    (53,  "udp"): "DNS",        (67,  "udp"): "DHCP",
+    (68,  "udp"): "DHCP",       (69,  "udp"): "TFTP",
+    (123, "udp"): "NTP",        (137, "udp"): "NetBIOS",
+    (161, "udp"): "SNMP",       (514, "udp"): "Syslog",
+    (443, "udp"): "QUIC",       (1900,"udp"): "SSDP",
+    (3478,"udp"): "STUN",       (5060,"udp"): "SIP",
+    (5353,"udp"): "mDNS",       (5355,"udp"): "LLMNR",
+}
+
+def _app_proto(sport, dport, transp) -> str:
+    """Best-effort application label for a flow (destination port first)."""
+    for p in (dport, sport):
+        hit = _APP_PORTS.get((p, transp))
+        if hit:
+            return hit
+    return ""
+
 class PacketCapture:
     def __init__(self):
         self._running     = False
         self._pkt_count   = 0
-        self._t0          = time.time()
+        self._pps_win     = deque()   # timestamps of packets in the last second
         self._local_ips   = get_local_ips()
         self._seen_conns: set   = set()
         self._seen_ts:    float = time.time()
         self._prev_nic:   dict  = {}
+        # Socket-event throttle (token bucket): cap live_packet/topo_packet at
+        # EMIT_RATE_PPS events/second so a busy LAN can't flood the browser.
+        self._emit_budget   = float(EMIT_RATE_PPS)
+        self._emit_last     = time.time()
 
     def start(self, iface: Optional[str] = None):
         self._running   = True
@@ -1050,38 +1125,60 @@ class PacketCapture:
         if SCAPY_OK and IS_ROOT:
             threading.Thread(target=self._scapy_loop, args=(iface,),
                              daemon=True, name="cap-scapy").start()
-            print("[NetSentinel] Capture: Scapy deep-capture (root)")
+            print("[Netron] Capture: Scapy deep-capture (root)")
         else:
             threading.Thread(target=self._conn_loop, daemon=True, name="cap-conn").start()
             threading.Thread(target=self._nic_loop,  daemon=True, name="cap-nic").start()
-            print("[NetSentinel] Capture: psutil poll (no-root mode)")
+            print("[Netron] Capture: psutil poll (no-root mode)")
 
     def stop(self): self._running = False
 
     # ── Scapy mode ────────────────────────────────────────────────────────────
     def _scapy_loop(self, iface):
         try:
+            # Capture the whole Internet protocol suite we can see on the wire:
+            # IPv4, IPv6 and ARP (BPF filter keeps non-IP frames out cheaply).
             sniff(iface=iface, prn=self._on_pkt, store=False,
-                  stop_filter=lambda _: not self._running, filter="ip")
+                  stop_filter=lambda _: not self._running,
+                  filter="ip or ip6 or arp")
         except Exception as e:
-            print(f"[NetSentinel] Scapy stopped ({e}), switching to psutil")
+            print(f"[Netron] Scapy stopped ({e}), switching to psutil")
             threading.Thread(target=self._conn_loop, daemon=True, name="cap-conn-fb").start()
             threading.Thread(target=self._nic_loop,  daemon=True, name="cap-nic-fb").start()
 
     def _on_pkt(self, pkt):
-        if not pkt.haslayer(IP): return
-        src, dst, length = pkt[IP].src, pkt[IP].dst, len(pkt)
+        # ── ARP (link-layer neighbour discovery, RFC 826) ─────────────────────
+        if pkt.haslayer(ARP):
+            a = pkt[ARP]
+            if a.op == 1:      # request
+                info = f"who-has {a.pdst}?  tell {a.psrc}"
+            elif a.op == 2:    # reply
+                info = f"{a.psrc} is-at {a.hwsrc}"
+            else:
+                info = f"op={a.op}  {a.psrc} → {a.pdst}"
+            self._emit(a.psrc, a.pdst, "ARP", len(pkt), info, None, None)
+            return
+
+        # ── Internet layer: IPv4 or IPv6 ──────────────────────────────────────
+        if pkt.haslayer(IP):
+            src, dst = pkt[IP].src, pkt[IP].dst
+            nh = pkt[IP].proto            # next header / protocol number
+        elif pkt.haslayer(IPv6):
+            src, dst = pkt[IPv6].src, pkt[IPv6].dst
+            nh = pkt[IPv6].nh
+        else:
+            return                        # non-IP frame (kept out by the BPF filter)
+        length = len(pkt)
         proto, info, sport, dport = "OTHER", "", None, None
 
-        if pkt.haslayer(TCP):
+        if pkt.haslayer(TCP):                                  # works over v4 and v6
             proto  = "TCP"
             sport, dport = pkt[TCP].sport, pkt[TCP].dport
             flags  = int(pkt[TCP].flags)
             if flags & 0x02 and not (flags & 0x10):
                 self._check_syn(src)
-            svc = ""
-            try: svc = socket.getservbyport(dport,"tcp") if dport < 1024 else ""
-            except Exception: pass
+            svc = (_app_proto(sport, dport, "tcp")
+                   or self._svc_name(dport, "tcp"))
             info = f":{sport} → :{dport}" + (f" [{svc}]" if svc else "") + f"  f={flags}"
         elif pkt.haslayer(UDP):
             proto  = "UDP"
@@ -1093,14 +1190,43 @@ class PacketCapture:
                 except Exception:
                     info = f":{sport} → :{dport}"
             else:
-                info = f":{sport} → :{dport}"
-        elif pkt.haslayer(ICMP):
+                svc = (_app_proto(sport, dport, "udp")
+                       or self._svc_name(dport, "udp"))
+                info = f":{sport} → :{dport}" + (f" [{svc}]" if svc else "")
+        elif nh == 1:                                          # ICMPv4
             proto = "ICMP"
-            info  = f"type={pkt[ICMP].type}"
+            if pkt.haslayer(ICMP):
+                info = f"type={pkt[ICMP].type} code={pkt[ICMP].code}"
+            else:
+                info = f"proto={nh}"
+        elif nh == 58:                                         # ICMPv6
+            proto = "ICMPv6"
+            # type/code are the first two bytes of the IPv6 payload
+            raw = bytes(pkt[IPv6].payload)
+            info = f"type={raw[0]} code={raw[1]}" if len(raw) >= 2 else f"proto=58"
+        elif nh == 6 or nh == 17:
+            # TCP/UDP payload scapy couldn't reassemble (e.g. odd offsets)
+            proto = "TCP" if nh == 6 else "UDP"
+            info  = f"proto={nh}"
+        else:
+            # Any other Internet protocol (e.g. SCTP 132, GRE 47, ESP 50,
+            # IPv6 Hop-by-Hop 0, Fragment 44) – show the protocol number
+            proto = "IPv6" if pkt.haslayer(IPv6) else "OTHER"
+            info  = f"proto={nh}"
 
         self._emit(src, dst, proto, length, info, sport, dport)
 
-    # ── psutil connection poll ────────────────────────────────────────────────
+    @staticmethod
+    def _svc_name(port: int, transp: str) -> str:
+        try:
+            return socket.getservbyport(port, transp) if port < 1024 else ""
+        except Exception:
+            return ""
+
+    # ── psutil connection poll (fallback) ─────────────────────────────────────
+    # Limitation (by design, not a bug): psutil reads the OS socket table, so
+    # this mode can only report TCP and UDP connections. Full capture of
+    # ICMP/ICMPv6/ARP/other protocols requires root + scapy mode.
     def _conn_loop(self):
         PMAP = {socket.SOCK_STREAM: "TCP", socket.SOCK_DGRAM: "UDP"}
         while self._running:
@@ -1135,9 +1261,11 @@ class PacketCapture:
 
     # ── NIC byte-counter poll ─────────────────────────────────────────────────
     def _nic_loop(self):
-        local_ip = next(iter(get_local_ips() - {"127.0.0.1"}), "0.0.0.0")
         while self._running:
             try:
+                # Re-resolve the primary local IP every pass – DHCP leases and
+                # VPN interfaces can change while we're running.
+                local_ip = _primary_local_ip()
                 for nic, s in psutil.net_io_counters(pernic=True).items():
                     if nic.startswith("lo"):
                         continue
@@ -1169,20 +1297,41 @@ class PacketCapture:
             for ip in (src, dst):
                 if ip in devices:
                     packet_log[ip].appendleft(rec)
-                    if ip == src: devices[ip]["bytes_out"] = devices[ip].get("bytes_out",0) + length
-                    else:         devices[ip]["bytes_in"]  = devices[ip].get("bytes_in", 0) + length
+                    if ip == src:
+                        devices[ip]["bytes_out"] = devices[ip].get("bytes_out",0) + length
+                        net_stats["total_out"]  += length
+                    else:
+                        devices[ip]["bytes_in"]  = devices[ip].get("bytes_in", 0) + length
+                        net_stats["total_in"]   += length
             self._pkt_count += 1
-            elapsed = max(1, time.time() - self._t0)
-            net_stats["pps"] = round(self._pkt_count / elapsed, 1)
-        socketio.emit("live_packet", rec)
-        # Lightweight topology event for the network graph
-        socketio.emit("topo_packet", {"src":src,"dst":dst,"proto":proto,"len":length})
+            # Instantaneous packets-per-second (1-second sliding window)
+            now = time.time()
+            self._pps_win.append(now)
+            while self._pps_win and self._pps_win[0] < now - 1.0:
+                self._pps_win.popleft()
+            net_stats["pps"] = len(self._pps_win)
+            # Token-bucket throttle for socket events: counters above stay
+            # exact, only the browser event stream is rate-limited.
+            elapsed  = max(0.0, now - self._emit_last)
+            self._emit_last = now
+            self._emit_budget = min(float(EMIT_RATE_PPS),
+                                    self._emit_budget + elapsed * EMIT_RATE_PPS)
+            should_send = self._emit_budget >= 1.0
+            if should_send:
+                self._emit_budget -= 1.0
+        if should_send:
+            socketio.emit("live_packet", rec)
+            # Lightweight topology event for the network graph
+            socketio.emit("topo_packet", {"src":src,"dst":dst,"proto":proto,"len":length})
 
     def _check_syn(self, src: str):
         syn_counters[src] += 1
-        if syn_counters[src] == ANOMALY_THRESH:
+        # Alert on the threshold and re-alert on every subsequent full window
+        # (modulo) so an ongoing flood isn't reported only once, ever.
+        if syn_counters[src] > 0 and syn_counters[src] % ANOMALY_THRESH == 0:
             add_alert(src, "SYN Flood Detected",
-                      f"Excessive SYN packets from {src}", "HIGH")
+                      f"Excessive SYN packets from {src} "
+                      f"({syn_counters[src]} and counting)", "HIGH")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1233,18 +1382,23 @@ class NetworkMonitor:
                 return None
         except Exception:
             pass
+        reconnect = None
         with _lock:
             existing = devices.get(ip)
             if existing is not None and existing.get("status") == "online":
                 return None
-        if existing is not None and existing.get("status") == "offline":
-            # Reconnect: bring it back online immediately
-            existing["status"] = "online"
-            existing["last_seen"] = _ts()
-            if mac != "N/A":
-                existing["mac"] = mac
-            socketio.emit("device_update", existing)
-            return existing
+            if existing is not None and existing.get("status") == "offline":
+                # Reconnect: bring it back online immediately
+                existing["status"]  = "online"
+                existing["last_seen"] = _ts()
+                if mac != "N/A":
+                    existing["mac"] = mac
+                missed_scans[ip] = 0
+                _arp_seen_ts[ip] = time.time()
+                reconnect = existing
+        if reconnect is not None:
+            socketio.emit("device_update", reconnect)
+            return reconnect
         vendor, dtype, brand = lookup_vendor(mac)
         ttl      = self.scanner.ping_ttl(ip)
         os_hint  = ("Linux / Android / macOS"   if 0 < ttl <= 64  else
@@ -1268,6 +1422,8 @@ class NetworkMonitor:
         with _lock:
             if ip not in devices:     # double-check after lock
                 devices[ip] = entry
+                missed_scans[ip] = 0
+                _arp_seen_ts[ip] = time.time()
             else:
                 return None
         socketio.emit("device_update", devices[ip])
@@ -1283,8 +1439,10 @@ class NetworkMonitor:
         hosts = self.scanner._arp_table(self.network)
         if not hosts:
             return
-        # Seed all devices in parallel (each may do a network call for vendor)
-        with ThreadPoolExecutor(max_workers=16, thread_name_prefix="seed") as ex:
+        # Seed all devices in parallel. The vendor APIs are rate-limited to
+        # ~1 req/s, so a small pool avoids a thundering herd of threads that
+        # would all just sit in the rate-limiter.
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="seed") as ex:
             list(ex.map(lambda h: self._register_arp_host(h["ip"], h.get("mac","N/A")), hosts))
 
     def _arp_watch_loop(self):
@@ -1298,12 +1456,14 @@ class NetworkMonitor:
             try:
                 hosts = self.scanner._arp_table(self.network)
                 if hosts:
-                    # Starter hosts only: skip ones we already track (online)
-                    new = [h for h in hosts
-                           if h["ip"] not in devices
-                           or devices.get(h["ip"], {}).get("status") != "online"]
+                    # Starter hosts only: skip ones we already track (online).
+                    # Snapshot under the lock – `devices` is mutated by other threads.
+                    with _lock:
+                        new = [h for h in hosts
+                               if h["ip"] not in devices
+                               or devices[h["ip"]].get("status") != "online"]
                     if new:
-                        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="arpwatch") as ex:
+                        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="arpwatch") as ex:
                             list(ex.map(
                                 lambda h: self._register_arp_host(h["ip"], h.get("mac","N/A")),
                                 new))
@@ -1326,14 +1486,14 @@ class NetworkMonitor:
         for h in hosts:
             ip, mac = h["ip"], h.get("mac","N/A")
             if ip in local_ips:
-                continue   # never show/track the machine running NetSentinel
+                continue   # never show/track the machine running Netron
             seen.add(ip)
             is_new = ip not in devices
             # lookup_vendor is fast if cached; _deep_scan will re-query if needed
             vendor, dtype, brand = lookup_vendor(mac)
             futures.append(
                 self._scan_pool.submit(
-                    self._deep_scan, ip, mac, vendor, dtype, brand, is_new
+                    self._deep_scan_guarded, ip, mac, vendor, dtype, brand, is_new
                 )
             )
         # Pre-warm vendor cache for any unknown MACs in a background thread
@@ -1345,13 +1505,29 @@ class NetworkMonitor:
                 for m in unknown_macs:
                     lookup_vendor(m)   # result goes into _vendor_cache
             threading.Thread(target=_prewarm, daemon=True, name="vendor-prewarm").start()
-        # Mark offline
+        # Mark offline — but only when a device was missed by TWO consecutive
+        # sweeps AND hasn't been seen in the OS ARP cache within the grace
+        # window. A single missed nmap result (Wi-Fi power-save, scan timeout)
+        # otherwise makes devices flap online/offline in the UI.
+        now = time.time()
+        to_emit = []
         with _lock:
             for ip in list(devices):
-                if ip not in seen and devices[ip].get("status") == "online":
-                    devices[ip]["status"] = "offline"
-                    devices[ip]["last_seen"] = _ts()
-                    socketio.emit("device_update", devices[ip])
+                dev = devices[ip]
+                if ip in seen:
+                    missed_scans[ip] = 0
+                    _arp_seen_ts[ip] = now
+                    continue
+                if dev.get("status") != "online":
+                    continue
+                missed_scans[ip] += 1
+                arp_age = now - _arp_seen_ts.get(ip, 0)
+                if missed_scans[ip] >= 2 and arp_age > ARP_GRACE_SECS:
+                    dev["status"] = "offline"
+                    dev["last_seen"] = _ts()
+                    to_emit.append(dev)
+        for dev in to_emit:
+            socketio.emit("device_update", dev)
 
     # ── HTTP banner grab ─────────────────────────────────────────────────────
     @staticmethod
@@ -1379,7 +1555,7 @@ class NetworkMonitor:
         ctx.verify_mode    = _ssl.CERT_NONE
         for url, port in candidates[:2]:    # try up to 2 ports
             try:
-                req = _ur.Request(url, headers={"User-Agent":"NetSentinel/3"})
+                req = _ur.Request(url, headers={"User-Agent":"Netron/3"})
                 r   = _ur.urlopen(req, timeout=3, context=ctx if "https" in url else None)
                 hdrs = dict(r.headers)
                 # Server header (e.g. "lighttpd/1.4.45", "mini_httpd", "GoAhead")
@@ -1405,6 +1581,16 @@ class NetworkMonitor:
             except Exception:
                 continue
         return info
+
+    def _deep_scan_guarded(self, ip, mac, vendor, dtype, brand, is_new):
+        """
+        _deep_scan wrapper that runs in the thread pool: any unexpected error
+        is logged and contained instead of silently killing the worker.
+        """
+        try:
+            self._deep_scan(ip, mac, vendor, dtype, brand, is_new)
+        except Exception as e:
+            log.warning("Deep scan failed for %s: %s", ip, e)
 
     def _deep_scan(self, ip, mac, vendor, dtype, brand, is_new):
         """
@@ -1536,6 +1722,8 @@ class NetworkMonitor:
                 "bytes_out":   existing.get("bytes_out", 0),
                 "is_gateway":  (ip == self.gateway),
             }
+            missed_scans[ip]   = 0     # a successful scan is positive evidence
+            _arp_seen_ts[ip]   = time.time()
 
         if is_new:
             add_alert(ip, "New Device Joined",
@@ -1638,8 +1826,8 @@ def _refine_dtype(dtype: str, vendor: str, os_str: str, ports: dict,
     if "windows server" in os_l:
         return "Windows Server"
     if "windows" in os_l:
-        if {3389, 135, 445} & open_set:
-            return "Windows PC"
+        if 3389 in open_set:
+            return "Windows PC (RDP)"   # remote desktop exposed
         return "Windows PC"
 
     # ── Linux ─────────────────────────────────────────────────────────────────
@@ -1826,10 +2014,32 @@ def get_all_activities_summary() -> dict:
 #  FLASK + SOCKET.IO
 # ─────────────────────────────────────────────────────────────────────────────
 app      = Flask(__name__)
-app.config["SECRET_KEY"] = "netsentry_v3_secret"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+# Random per-run session key – never reuse a hardcoded secret.
+app.config["SECRET_KEY"] = secrets.token_hex(32)
+# Same-origin only (default). The dashboard is served by this app, so no
+# cross-origin browser clients are needed; "*" would let any website open a
+# socket to this host while a user has the dashboard open.
+socketio = SocketIO(app, async_mode="threading",
                     logger=False, engineio_logger=False)
 monitor  = NetworkMonitor()
+
+# ── CSRF protection for mutating API routes ─────────────────────────────────
+# A random token is embedded in the dashboard page each run; state-changing
+# calls must echo it in the X-NS-Auth header. Other origins can't read the
+# page (same-origin policy), so they can't learn the token – this stops
+# other websites from silently POSTing block/unblock/rescan on behalf of a
+# logged-in user. It is NOT a login: anyone who can open the dashboard page
+# on the LAN can read the token from it.
+AUTH_TOKEN = secrets.token_hex(16)
+
+def require_auth(fn):
+    """Reject mutating API requests that don't carry the dashboard token."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if request.headers.get("X-NS-Auth", "") != AUTH_TOKEN:
+            return jsonify({"error": "unauthorized – missing/invalid X-NS-Auth token"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
 
 @app.route("/api/devices")
 def api_devices():
@@ -1849,6 +2059,7 @@ def api_alerts():
     with _lock: return jsonify(list(alerts))
 
 @app.route("/api/alerts/ack/<aid>", methods=["POST"])
+@require_auth
 def api_ack(aid):
     with _lock:
         for a in alerts:
@@ -1867,6 +2078,10 @@ def api_stats():
 # In-memory set of blocked IPs (ip → mac mapping kept for cleanup)
 blocked_devices: Dict[str, str] = {}   # ip → mac
 
+# tc state so we never stack duplicate qdiscs and know when to remove them
+_tc_qdisc_created: set = set()         # interfaces where we added a root qdisc
+_tc_filter_count:  Dict[str, int] = {} # interface → active DROP filters
+
 def _run(cmd: List[str], timeout: int = 6) -> Tuple[bool, str]:
     """Run a shell command, return (success, output)."""
     try:
@@ -1875,6 +2090,43 @@ def _run(cmd: List[str], timeout: int = 6) -> Tuple[bool, str]:
         return r.returncode == 0, (r.stdout + r.stderr).strip()
     except Exception as e:
         return False, str(e)
+
+def _get_gateway_mac() -> str:
+    """
+    Resolve the REAL MAC of the default gateway from the local ARP/neighbour
+    table. Returns "" when it cannot be determined.
+    """
+    # Preferred: ip neigh (iproute2, Linux)
+    try:
+        out = subprocess.check_output(["ip", "neigh", "show"],
+                                      stderr=subprocess.DEVNULL, timeout=3
+                                      ).decode(errors="ignore")
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) >= 5 and p[0] == monitor.gateway and p[-1] not in ("FAILED", "INCOMPLETE"):
+                m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", line)
+                if m and m.group(1).upper() != "00:00:00:00:00:00":
+                    return m.group(1).upper()
+    except Exception:
+        pass
+    # Fallback: /proc/net/arp (Linux)
+    try:
+        with open("/proc/net/arp") as fh:
+            for line in fh.readlines()[1:]:
+                p = line.split()
+                if len(p) >= 4 and p[0] == monitor.gateway and \
+                   p[3] not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+                    return p[3].upper()
+    except Exception:
+        pass
+    return ""
+
+# Bogus MAC used for ARP-poisoning the blocked device. It must be a valid
+# UNICAST, LOCALLY-ADMINISTERED address (first byte even = unicast, second
+# hex digit 6 = locally administered) so stacks actually cache it —
+# ff:ff:ff:ff:ff:ff is multicast/broadcast and most ARP implementations
+# refuse to cache it, which made the old poison a no-op.
+POISON_MAC = "06:00:5a:53:4e:31"   # locally administered, unicast
 
 def _block_device(ip: str, mac: str) -> Tuple[bool, List[str]]:
     """
@@ -1916,23 +2168,39 @@ def _block_device(ip: str, mac: str) -> Tuple[bool, List[str]]:
             ok_any = True
             msgs.append(f"arptables rule added")
 
-    # ── Method 4: Send ARP poison via scapy (deauth the device off the LAN) ───
+    # ── Method 4: ARP poison via scapy (deauth the device off the LAN) ────────
+    # Tell the victim that the gateway's IP maps to a bogus locally-
+    # administered MAC. Because real ARP caches expire, keep re-poisoning in
+    # the background for as long as the device stays blocked.
     if SCAPY_OK and IS_ROOT and mac_u:
         try:
-            from scapy.all import ARP, Ether, sendp, get_if_hwaddr, conf
+            from scapy.all import ARP, Ether, sendp
             gw = monitor.gateway
-            # Broadcast a fake ARP reply: tell the device the gateway MAC is FF:FF:FF:FF:FF:FF
-            # This breaks the device's ARP cache so it can't route traffic
             poison_pkt = (
                 Ether(dst=mac_u) /
                 ARP(op=2, pdst=ip, hwdst=mac_u,
                     psrc=gw,
-                    hwsrc="ff:ff:ff:ff:ff:ff")
+                    hwsrc=POISON_MAC)
             )
             # Send 5 times to ensure it lands
             sendp(poison_pkt, count=5, inter=0.1, verbose=False)
             ok_any = True
             msgs.append("ARP poison sent (scapy deauth)")
+
+            def _repoison():
+                """Refresh the poison every 10 s until the device is unblocked."""
+                while ip in blocked_devices:
+                    time.sleep(10)
+                    if ip not in blocked_devices:
+                        break
+                    try:
+                        sendp(poison_pkt, count=2, inter=0.1, verbose=False)
+                    except Exception:
+                        break
+
+            threading.Thread(target=_repoison, daemon=True,
+                             name=f"poison-{ip}").start()
+            msgs.append("Periodic re-poison active while blocked")
         except Exception as e:
             msgs.append(f"ARP poison failed: {e}")
 
@@ -1944,8 +2212,12 @@ def _block_device(ip: str, mac: str) -> Tuple[bool, List[str]]:
         iface_m = re.search(r"dev\s+(\S+)", result.stdout)
         iface   = iface_m.group(1) if iface_m else None
         if iface:
-            # Add qdisc if not there, then filter to DROP
-            _run(["tc", "qdisc", "add", "dev", iface, "root", "handle", "1:", "prio"])
+            # Add qdisc only once per interface, then filter to DROP
+            if iface not in _tc_qdisc_created:
+                ok_q, _ = _run(["tc", "qdisc", "add", "dev", iface, "root",
+                                "handle", "1:", "prio"])
+                if ok_q:
+                    _tc_qdisc_created.add(iface)
             ok2, _ = _run([
                 "tc", "filter", "add", "dev", iface, "parent", "1:",
                 "protocol", "ip", "u32", "match", "ip", "dst", ip,
@@ -1953,6 +2225,7 @@ def _block_device(ip: str, mac: str) -> Tuple[bool, List[str]]:
             ])
             if ok2:
                 ok_any = True
+                _tc_filter_count[iface] = _tc_filter_count.get(iface, 0) + 1
                 msgs.append(f"tc filter added on {iface}")
     except Exception:
         pass
@@ -1988,24 +2261,24 @@ def _unblock_device(ip: str, mac: str) -> List[str]:
         _run(["arptables", "-D", "OUTPUT", "--dst-ip", ip,
               "--src-mac", mac_u, "-j", "DROP"])
 
-    # Restore ARP via scapy – broadcast the real gateway MAC back to the device
+    # Restore ARP via scapy – tell the victim the REAL gateway MAC.
+    # (Announcing our own interface MAC here would route the victim's
+    # gateway traffic through this host — a MITM position, not a restore.)
     if SCAPY_OK and IS_ROOT and mac_u:
         try:
-            from scapy.all import ARP, Ether, sendp, get_if_hwaddr, conf
-            gw  = monitor.gateway
-            # Find our real MAC
-            try:
-                my_mac = get_if_hwaddr(conf.iface)
-            except Exception:
-                my_mac = None
-            if my_mac:
+            from scapy.all import ARP, Ether, sendp
+            gw     = monitor.gateway
+            gw_mac = _get_gateway_mac()
+            if gw_mac:
                 restore_pkt = (
                     Ether(dst=mac_u) /
                     ARP(op=2, pdst=ip, hwdst=mac_u,
-                        psrc=gw, hwsrc=my_mac)
+                        psrc=gw, hwsrc=gw_mac)
                 )
                 sendp(restore_pkt, count=5, inter=0.1, verbose=False)
-                msgs.append("ARP table restored via scapy")
+                msgs.append("ARP table restored (real gateway MAC)")
+            else:
+                msgs.append("ARP restore skipped – gateway MAC unknown")
         except Exception as e:
             msgs.append(f"ARP restore note: {e}")
 
@@ -2015,9 +2288,16 @@ def _unblock_device(ip: str, mac: str) -> List[str]:
                                  capture_output=True, text=True, timeout=3)
         iface_m = re.search(r"dev\s+(\S+)", result.stdout)
         iface   = iface_m.group(1) if iface_m else None
-        if iface:
-            _run(["tc", "filter", "del", "dev", iface, "parent", "1:",
-                  "protocol", "ip", "u32", "match", "ip", "dst", ip])
+        if iface and _tc_filter_count.get(iface, 0) > 0:
+            ok, _ = _run(["tc", "filter", "del", "dev", iface, "parent", "1:",
+                          "protocol", "ip", "u32", "match", "ip", "dst", ip,
+                          "action", "drop"])
+            if ok:
+                _tc_filter_count[iface] -= 1
+                # Remove our qdisc when the last filter is gone
+                if _tc_filter_count[iface] <= 0 and iface in _tc_qdisc_created:
+                    _run(["tc", "qdisc", "del", "dev", iface, "root"])
+                    _tc_qdisc_created.discard(iface)
     except Exception:
         pass
 
@@ -2025,6 +2305,7 @@ def _unblock_device(ip: str, mac: str) -> List[str]:
 
 
 @app.route("/api/block/<ip>", methods=["POST"])
+@require_auth
 def api_block(ip):
     d = devices.get(ip)
     if not d: return jsonify({"error": "unknown IP"}), 404
@@ -2060,6 +2341,7 @@ def api_block(ip):
 
 
 @app.route("/api/unblock/<ip>", methods=["POST"])
+@require_auth
 def api_unblock(ip):
     mac = blocked_devices.pop(ip, devices.get(ip, {}).get("mac", "N/A"))
 
@@ -2073,6 +2355,7 @@ def api_unblock(ip):
         if ip in devices:
             devices[ip]["blocked"] = False
             devices[ip]["status"]  = "online"
+            missed_scans[ip]       = 0
 
     add_alert(ip, "Device Unblocked",
               f"{devices.get(ip,{}).get('vendor', ip)} at {ip} reconnected", "INFO")
@@ -2084,6 +2367,31 @@ def api_unblock(ip):
         "root":    IS_ROOT,
     })
 
+def _quick_jitter_ms(samples: int = 8) -> Tuple[float, float]:
+    """
+    Measure real HTTP latency/jitter: quick GETs to a tiny 204 endpoint,
+    returning (median_ttfb_ms, jitter_stdev_ms). Values are actual
+    measurements (each sample includes TCP+TLS connection setup); when the
+    endpoint is unreachable, returns (0.0, 0.0).
+    """
+    import urllib.request as _ur, time as _t, statistics as _stat
+    rtts: list = []
+    for _ in range(samples):
+        try:
+            t0 = _t.monotonic()
+            r = _ur.urlopen("https://www.google.com/generate_204", timeout=4)
+            r.read(64)
+            rtts.append((_t.monotonic() - t0) * 1000)
+        except Exception:
+            pass
+        _t.sleep(0.05)
+    if len(rtts) < 3:
+        return 0.0, 0.0
+    rtts.sort()
+    trimmed = rtts[: max(3, int(len(rtts) * 0.75))]   # drop worst outliers
+    med = trimmed[len(trimmed) // 2]
+    return round(med, 1), round(_stat.stdev(trimmed), 1)
+
 @app.route("/api/speedtest")
 def api_speedtest():
     """
@@ -2092,9 +2400,9 @@ def api_speedtest():
     Strategy (in priority order):
     1. speedtest-cli Python API  – if installed and reachable, the gold standard
     2. speedtest-cli CLI binary  – subprocess fallback for the Python module
-    3. Multi-endpoint HTTP probe – accurate latency via TTFB, chunked DL/UL speed
+    3. Multi-endpoint HTTP probe – HTTP latency/jitter via TTFB, chunked DL/UL speed
     """
-    import urllib.request as _ur, _thread, math as _math
+    import urllib.request as _ur
     import time as _t, json as _json, statistics as _stat
 
     result = {
@@ -2118,12 +2426,12 @@ def api_speedtest():
         result["download_mbps"] = round(r.get("download", 0) / 1_000_000, 2)
         result["upload_mbps"]   = round(r.get("upload",   0) / 1_000_000, 2)
         result["latency_ms"]    = round(r.get("ping",     0), 1)
-        # Compute jitter from per-request latencies if available
-        try:
-            pings = [x.get("latency", 0) for x in r.get("share_results", []) if x]
-            result["jitter_ms"] = round(_stat.stdev(pings), 1) if len(pings) > 1 else 0.0
-        except Exception:
-            result["jitter_ms"] = round(r.get("ping", 0) * 0.08, 1)
+        # speedtest-cli's results.dict() exposes no per-request latencies, so
+        # jitter cannot be derived here – measure it with real quick probes
+        # rather than inventing a value.
+        if result["jitter_ms"] == 0.0:
+            _, jit = _quick_jitter_ms()
+            result["jitter_ms"] = jit
         srv = r.get("server", {})
         result["server"] = f"{srv.get('name','')}, {srv.get('country','')}".strip(", ")
         result["isp"]    = r.get("client", {}).get("isp", "")
@@ -2143,7 +2451,9 @@ def api_speedtest():
             result["download_mbps"] = round(d.get("download", 0) / 1_000_000, 2)
             result["upload_mbps"]   = round(d.get("upload",   0) / 1_000_000, 2)
             result["latency_ms"]    = round(d.get("ping",     0), 1)
-            result["jitter_ms"]     = round(d.get("ping", 0) * 0.08, 1)
+            # --json has no jitter field – measure it with real quick probes
+            _, jit = _quick_jitter_ms()
+            result["jitter_ms"] = jit
             srv = d.get("server", {})
             result["server"] = f"{srv.get('name','')}, {srv.get('country','')}".strip(", ")
             result["isp"]    = d.get("client", {}).get("isp", "")
@@ -2165,37 +2475,43 @@ def api_speedtest():
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── Latency probes ────────────────────────────────────────────────────────
-    LAT_TARGETS = [
-        "https://pypi.org/pypi/pip/json",
-        "https://registry.npmjs.org/express/latest",
-        "https://pypi.org/pypi/setuptools/json",
-        "https://files.pythonhosted.org/packages/source/p/pip/",
-    ]
-    raw_lats: list = []
-    for url in LAT_TARGETS:
-        for _ in range(3):
-            try:
-                t0 = _t.monotonic()
-                r  = _ur.urlopen(url, timeout=5)
-                r.read(256)   # only need the first response bytes
-                raw_lats.append((_t.monotonic() - t0) * 1000)
-            except Exception:
-                pass
-            _t.sleep(0.04)
+    # Primary: median TTFB to a tiny 204 endpoint (each sample includes
+    # connection setup; the median plus the stdev give latency and jitter).
+    # Fallback: TTFB to a few JSON endpoints, in case that endpoint is
+    # blocked/unreachable.
+    med_rtt, jit = _quick_jitter_ms()
+    if med_rtt:
+        result["latency_ms"] = med_rtt
+        result["jitter_ms"]  = jit
+    else:
+        LAT_TARGETS = [
+            "https://pypi.org/pypi/pip/json",
+            "https://registry.npmjs.org/express/latest",
+            "https://pypi.org/pypi/setuptools/json",
+            "https://pypi.org/simple/pip/",
+        ]
+        raw_lats: list = []
+        for url in LAT_TARGETS:
+            for _ in range(3):
+                try:
+                    t0 = _t.monotonic()
+                    r  = _ur.urlopen(url, timeout=5)
+                    r.read(256)   # only need the first response bytes
+                    raw_lats.append((_t.monotonic() - t0) * 1000)
+                except Exception:
+                    pass
+                _t.sleep(0.04)
 
-    if raw_lats:
-        raw_lats.sort()
-        # Trim top 20% outliers (network spikes, proxy delays)
-        trim_n     = max(1, int(len(raw_lats) * 0.80))
-        trimmed    = raw_lats[:trim_n]
-        avg_lat    = sum(trimmed) / len(trimmed)
-        # Subtract average HTTPS overhead (~10-20 ms TLS + TCP) if we have many samples
-        # We approximate RTT as 60% of TTFB (empirical for proxied HTTPS)
-        rtt_approx = avg_lat * 0.60
-        result["latency_ms"] = round(rtt_approx, 1)
-        result["jitter_ms"]  = round(
-            _stat.stdev(trimmed) if len(trimmed) > 1 else 0.0, 1
-        )
+        if raw_lats:
+            raw_lats.sort()
+            # Trim top 20% outliers (network spikes, proxy delays)
+            trim_n     = max(1, int(len(raw_lats) * 0.80))
+            trimmed    = raw_lats[:trim_n]
+            avg_lat    = sum(trimmed) / len(trimmed)
+            result["latency_ms"] = round(avg_lat, 1)
+            result["jitter_ms"]  = round(
+                _stat.stdev(trimmed) if len(trimmed) > 1 else 0.0, 1
+            )
 
     # ── Download speed ────────────────────────────────────────────────────────
     DL_TARGETS = [
@@ -2241,10 +2557,12 @@ def api_speedtest():
         )
 
     # ── Upload speed ──────────────────────────────────────────────────────────
-    # POST a 1 MB payload; measure only the transfer window (not response time)
+    # POST a 1 MB payload; measure only the transfer window (not response time).
+    # Targets accept POSTed bodies (discarding them) so the send time reflects
+    # real upstream throughput.
     UL_TARGETS = [
-        "https://registry.npmjs.org/-/v1/search?text=x",
-        "https://pypi.org/search/",
+        "https://httpbin.org/post",
+        "https://postman-echo.com/post",
     ]
     ul_rates: list = []
     payload = bytes(1_000_000)   # 1 MB of zeros
@@ -2271,7 +2589,7 @@ def api_speedtest():
     if ul_rates:
         result["upload_mbps"] = round(sum(ul_rates) / len(ul_rates), 2)
 
-    result["status"] = "HTTP probe (accurate)"
+    result["status"] = "HTTP probe"
     return jsonify(result)
 
 
@@ -2287,6 +2605,9 @@ def api_activities_summary():
     return jsonify(get_all_activities_summary())
 
 
+# Only allow plausible hostnames/domains (prevents path tricks & URL injection)
+_FAVICON_HOST_RE = re.compile(r"^[a-zA-Z0-9._-]{1,253}$")
+
 @app.route("/favicon/<path:host>")
 def api_site_favicon(host):
     """Proxy a site's favicon server-side so the browser avoids CORS issues.
@@ -2294,7 +2615,8 @@ def api_site_favicon(host):
     Returns the fetched image bytes with permissive CORS headers; 404 if it
     cannot be retrieved (the frontend then falls back to the globe icon).
     """
-    if not host:
+    host = (host or "").strip().strip("/")
+    if not _FAVICON_HOST_RE.match(host):
         return ("", 404)
     bytes_io = _fetch_site_favicon(host)
     if bytes_io is None:
@@ -2309,11 +2631,12 @@ def api_site_favicon(host):
 
 def _fetch_site_favicon(host: str):
     """Fetch a favicon for host (Google s2 service), returning a BytesIO or None."""
-    if not REQUESTS_OK:
+    if not REQUESTS_OK or not _FAVICON_HOST_RE.match(host):
         return None
     try:
-        url = f"https://www.google.com/s2/favicons?domain={host}&sz=64"
-        r = _http.get(url, timeout=4, headers={"User-Agent": "NetSentinel/3.0"})
+        from urllib.parse import quote
+        url = f"https://www.google.com/s2/favicons?domain={quote(host, safe='.-')}&sz=64"
+        r = _http.get(url, timeout=4, headers={"User-Agent": f"Netron/{VERSION}"})
         if r.status_code == 200 and r.content:
             import io
             return io.BytesIO(r.content)
@@ -2322,11 +2645,12 @@ def _fetch_site_favicon(host: str):
     return None
 
 @app.route("/api/rescan/<ip>", methods=["POST"])
+@require_auth
 def api_rescan(ip):
     d = devices.get(ip)
     if not d: return jsonify({"error":"unknown IP"}),404
     threading.Thread(
-        target=monitor._deep_scan,
+        target=monitor._deep_scan_guarded,
         args=(ip, d.get("mac","N/A"), d.get("vendor",""),
               d.get("device_type",""), d.get("brand",""), False),
         daemon=True,
@@ -2444,7 +2768,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NetSentinel v3 – Network Dashboard</title>
+<title>Netron v3 – Network Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -2568,6 +2892,7 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 .pkt-ts{color:var(--muted);min-width:68px}
 .pkt-proto{min-width:46px;font-weight:700}
 .pkt-TCP{color:#64b5f6}.pkt-UDP{color:#81c784}.pkt-ICMP{color:#ffb74d}
+.pkt-ICMPv6{color:#4dd0e1}.pkt-ARP{color:#9e9e9e}.pkt-IPv6{color:#b0a8e0}
 .pkt-RECV{color:#ce93d8}.pkt-SEND{color:#00e676}.pkt-OTHER{color:var(--muted)}
 .pkt-src{color:var(--accent)}.pkt-dst{color:#ce93d8}
 .pkt-info{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
@@ -2596,7 +2921,7 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 
 
 /* TOPOLOGY */
-#topo-canvas{background:var(--bg);image-rendering:crisp-edges}
+#topo-canvas{background:var(--bg);image-rendering:crisp-edges;display:block}
 #topo-wrap{user-select:none}
 #topo-trace::-webkit-scrollbar{width:3px}
 #topo-trace::-webkit-scrollbar-thumb{background:var(--border)}
@@ -2611,17 +2936,6 @@ tr:hover td{background:var(--bg3);cursor:pointer}
   font-family:inherit;transition:all .15s;white-space:nowrap}
 .tbtn:hover{border-color:var(--accent);color:var(--accent)}
 .tbtn.active{background:var(--accent2);border-color:var(--accent2);color:#fff}
-
-/* TOPOLOGY GRAPH */
-#topo-canvas{background:var(--bg);image-rendering:crisp-edges;display:block}
-#topo-wrap{user-select:none}
-#topo-trace::-webkit-scrollbar{width:3px}
-#topo-trace::-webkit-scrollbar-thumb{background:var(--border)}
-.trace-row{display:flex;gap:6px;padding:3px 0;border-bottom:1px solid rgba(26,37,53,.5);line-height:1.5}
-.trace-row:last-child{border-bottom:none}
-.tr-proto{min-width:36px;font-weight:700}
-.tr-TCP{color:#64b5f6}.tr-UDP{color:#81c784}.tr-ICMP{color:#ffb74d}
-.tr-RECV{color:#ce93d8}.tr-SEND{color:#00e676}.tr-OTHER{color:var(--muted)}
 
 /* SCROLLBAR */
 ::-webkit-scrollbar{width:4px;height:4px}
@@ -2639,7 +2953,7 @@ tr:hover td{background:var(--bg3);cursor:pointer}
       <path d="M13 1v5M13 20v5M1 13h5M20 13h5" stroke="#00e5ff" stroke-width="1.4" stroke-linecap="round"/>
       <circle cx="13" cy="13" r="8.5" stroke="#00e5ff" stroke-width=".4" stroke-dasharray="2 2.8"/>
     </svg>
-    NetSentinel <span style="font-size:10px;opacity:.5;margin-left:4px">v3</span>
+    Netron <span style="font-size:10px;opacity:.5;margin-left:4px">v3</span>
   </div>
   <div class="hdr-meta">
     <span id="hdr-net" class="mono">—</span>
@@ -2915,8 +3229,10 @@ tr:hover td{background:var(--bg3);cursor:pointer}
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:9px;font-size:10px">
     <span style="color:var(--muted)">Legend:</span>
     <span style="color:#64b5f6">■ TCP</span><span style="color:#81c784">■ UDP</span>
-    <span style="color:#ffb74d">■ ICMP</span><span style="color:#ce93d8">■ RECV</span>
+    <span style="color:#ffb74d">■ ICMP</span><span style="color:#4dd0e1">■ ICMPv6</span>
+    <span style="color:#9e9e9e">■ ARP</span><span style="color:#ce93d8">■ RECV</span>
     <span style="color:#00e676">■ SEND</span>
+    <span style="color:var(--muted);margin-left:auto" id="cap-note"></span>
   </div>
   <div class="pkt-stream" id="pkt-stream">
     <div id="pkt-ph" style="color:var(--muted);padding:18px;text-align:center">⏳ Waiting for traffic…</div>
@@ -3137,6 +3453,25 @@ let curModal = null, paused = false, pktTotal = 0, capMode = null;
 let chTypes = null, chSev = null;
 const devCharts = {};
 
+// CSRF token (embedded server-side) – required on mutating API calls
+const NS_AUTH = "{{ auth_token }}";
+async function authFetch(url, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers || {}, { "X-NS-Auth": NS_AUTH });
+  const r = await fetch(url, opts);
+  if (r.status === 403) {
+    toast({severity:"HIGH", title:"Not authorized",
+           detail:"Server rejected the request token"});
+    throw new Error("unauthorized");
+  }
+  return r;
+}
+
+// HTML-escape user/device-controlled strings before injecting into innerHTML
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
 // ── Socket events ─────────────────────────────────────────────────────────
 const _pendingDeviceUpdates = [];
 socket.on("initial_state", d => {
@@ -3157,6 +3492,7 @@ socket.on("device_update", d => {
   if (active("graphs")) renderGraphs();
   if (active("ports")) renderPorts();
   if (active("vulns")) renderVulns();
+  if (active("activities")) actRefreshDeviceGrid();
 });
 socket.on("new_alert", a => {
   S.alerts.unshift(a);
@@ -3166,7 +3502,15 @@ socket.on("new_alert", a => {
   if (active("overview")) renderOvAlerts();
   updateCounters();
 });
-socket.on("live_packet", p => { if (!paused) addPkt(p); });
+socket.on("live_packet", p => {
+  if (!paused) addPkt(p);
+  // Activities overlay buffers packets for its own graph
+  if (ACT_STATE.currentIP && !ACT_STATE.paused &&
+      (p.src === ACT_STATE.currentIP || p.dst === ACT_STATE.currentIP)) {
+    ACT_STATE._pktBuf.push(p);
+    if (ACT_STATE._pktBuf.length > 500) ACT_STATE._pktBuf.splice(0, 100);
+  }
+});
 socket.on("topo_packet", p => { if (_topoInited) TOPO.onTopoPacket(p); });
 socket.on("traffic_update", d => {
   el("s-pps", d.data ? Object.values(d.data).reduce((s,v)=>s+Math.round((v.in+v.out)/200),0) : 0);
@@ -3223,12 +3567,15 @@ const TOPO = (() => {
     gateway:  '#00e5ff',
   };
   const PROTO_COL = {
-    TCP:'#64b5f6', UDP:'#81c784', ICMP:'#ffb74d',
+    TCP:'#64b5f6', UDP:'#81c784', ICMP:'#ffb74d', ICMPv6:'#4dd0e1',
+    ARP:'#9e9e9e', IPv6:'#b0a8e0',
     RECV:'#ce93d8', SEND:'#00e676', OTHER:'#7c8fa8'
   };
   const PROTO_EDGE = {
     TCP:'rgba(100,181,246,', UDP:'rgba(129,200,132,',
-    ICMP:'rgba(255,183,77,', RECV:'rgba(206,147,216,',
+    ICMP:'rgba(255,183,77,', ICMPv6:'rgba(77,208,225,',
+    ARP:'rgba(158,158,158,', IPv6:'rgba(176,168,224,',
+    RECV:'rgba(206,147,216,',
     SEND:'rgba(0,230,118,',  OTHER:'rgba(124,143,168,'
   };
 
@@ -3236,12 +3583,13 @@ const TOPO = (() => {
   function category(dtype, isGW) {
     if (isGW) return 'router';
     const d = (dtype||'').toLowerCase();
-    if (d.includes('router') || d.includes('gateway') || d.includes('ap') || d.includes('switch')) return 'router';
+    // \bap\b – "ap" must be a standalone word, so "laptop" doesn't match
+    if (d.includes('router') || d.includes('gateway') || /\bap\b/.test(d) || d.includes('access point') || d.includes('switch')) return 'router';
     if (d.includes('iphone') || d.includes('mobile phone') || d.includes('android') || d === 'mobile') return 'phone';
     if (d.includes('ipad') || d.includes('tablet')) return 'tablet';
+    if (d.includes('macbook')) return 'laptop';
     if (d.includes('laptop')) return 'laptop';
     if (d.includes('mac') && !d.includes('macbook')) return 'desktop';
-    if (d.includes('macbook')) return 'laptop';
     if (d.includes('pc') || d.includes('desktop') || d.includes('workstation')) return 'desktop';
     if (d.includes('server') || d.includes('nas')) return 'server';
     if (d.includes('smart tv') || d.includes('television')) return 'tv';
@@ -3607,8 +3955,7 @@ const TOPO = (() => {
         proto:        e.proto||'OTHER',
         count:        ec,
         bytes:        e.bytes||0,
-        recentBytes:  0,          // reset decay counter on topology refresh
-        alpha:        Math.min(0.75, 0.12 + ec * 0.015)
+        recentBytes:  0           // reset decay counter on topology refresh
       });
     });
 
@@ -3627,7 +3974,7 @@ const TOPO = (() => {
         }
         if (!edges[kn]) {
           edges[kn] = {a:pair[0], b:pair[1], proto:'OTHER',
-                       count:0, bytes:0, recentBytes:0, alpha:0.18, activity:0};
+                       count:0, bytes:0, recentBytes:0, activity:0};
         }
       });
     }
@@ -4086,7 +4433,7 @@ const TOPO = (() => {
     const ekn   = epair[0]+'|'+epair[1];
     if (!edges[ekn]) {
       edges[ekn] = {a:epair[0], b:epair[1], proto:p.proto,
-                    count:0, bytes:0, recentBytes:0, alpha:0.18, activity:0};
+                    count:0, bytes:0, recentBytes:0, activity:0};
     }
     const e = edges[ekn];
 
@@ -4138,7 +4485,7 @@ const TOPO = (() => {
         const ekn  = pair[0]+'|'+pair[1];
         if (!edges[ekn]) {
           edges[ekn] = {a:pair[0], b:pair[1], proto:'OTHER',
-                        count:0, bytes:0, recentBytes:0, alpha:0.18, activity:0};
+                        count:0, bytes:0, recentBytes:0, activity:0};
         }
       }
     }
@@ -4327,7 +4674,7 @@ function renderDevices() {
     const vendorRaw  = d.brand || d.vendor || "";
     const vendorIsIP = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(vendorRaw.trim());
     const vendorDisp = (!_isBlank(vendorRaw) && !vendorIsIP)
-      ? `<span title="${vendorRaw}">${vendorRaw.substring(0,18)}</span>`
+      ? `<span title="${esc(vendorRaw)}">${esc(vendorRaw.substring(0,18))}</span>`
       : `<span class="mono" style="color:var(--accent);font-size:10px">${d.ip}</span>`;
 
     // ── Device type: show IP when unknown/empty, no icon for IP ───────────────
@@ -4338,13 +4685,13 @@ function renderDevices() {
     const typeLabel = typeBlank ? d.ip : typeRaw;
     const typeDisp  = typeBlank
       ? `<span class="mono" style="color:var(--accent);font-size:10px">${d.ip}</span>`
-      : `${typeIcon?typeIcon+" ":""}${typeRaw}`;
+      : `${typeIcon?typeIcon+" ":""}${esc(typeRaw)}`;
 
     // ── OS: resolve to exact fallback text, never show Apple icon for unknowns ──
     const osResolved = resolveOsDisplay(d.os, d.ttl);
     const osText     = osResolved.text;
     const osIcon_    = osResolved.icon;  // "" for any mixed/unknown OS
-    const osAcc      = d.os_accuracy ? d.os_accuracy.replace(/~ARP seed/,"detecting…") : "";
+    const osAcc      = d.os_accuracy ? d.os_accuracy.replace("ARP (fast scan pending)","detecting…") : "";
 
     // ── Status + blocked styling ────────────────────────────────────────────
     const isBlocked  = !!(d.blocked || d.status === "blocked");
@@ -4352,26 +4699,26 @@ function renderDevices() {
     const statusDot  = isBlocked ? "dot-off" : isOnline ? "dot-on" : "dot-off";
     const statusText = isBlocked
       ? '<span style="color:var(--red);font-weight:600;font-size:10px">🚫 blocked</span>'
-      : `<span style="color:${isOnline?"var(--green)":"var(--muted)"}">${d.status||"offline"}</span>`;
+      : `<span style="color:${isOnline?"var(--green)":"var(--muted)"}">${esc(d.status)||"offline"}</span>`;
 
     return `<tr onclick="openModal('${d.ip}')"
         style="${isBlocked?"opacity:.65;background:rgba(255,45,85,.04)":""}">
       <td style="white-space:nowrap"><span class="dot ${statusDot}"></span>${statusText}</td>
       <td class="ip" style="white-space:nowrap">${d.ip}</td>
-      <td class="mac-addr">${d.mac||"–"}</td>
+      <td class="mac-addr">${esc(d.mac)||"–"}</td>
       <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-          title="${d.hostname||""}">${d.hostname||"–"}</td>
+          title="${esc(d.hostname||"")}">${esc(d.hostname)||"–"}</td>
       <td style="white-space:nowrap">${typeDisp}</td>
       <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${vendorDisp}</td>
       <td>
-        <span class="os-badge" title="${osText}">${osIcon_?osIcon_+" ":""}${osText}</span>
-        ${osAcc?`<span style="font-size:9px;color:var(--muted);display:block;margin-top:1px">${osAcc}</span>`:""}
+        <span class="os-badge" title="${esc(osText)}">${osIcon_?osIcon_+" ":""}${esc(osText)}</span>
+        ${osAcc?`<span style="font-size:9px;color:var(--muted);display:block;margin-top:1px">${esc(osAcc)}</span>`:""}
       </td>
       <td style="text-align:center">${Object.keys(d.open_ports||{}).length}</td>
       <td style="text-align:center">${(d.vuln_count||0)>0
           ?`<span style="color:var(--red);font-weight:700">${d.vuln_count}</span>`:"0"}</td>
       <td class="mono" style="font-size:10px;color:var(--muted);white-space:nowrap">${d.ttl||"–"}</td>
-      <td style="font-size:10px;color:var(--muted);white-space:nowrap">${(d.last_seen||"").substring(11)||""}</td>
+      <td style="font-size:10px;color:var(--muted);white-space:nowrap">${esc((d.last_seen||"").substring(11))||""}</td>
       <td onclick="event.stopPropagation()" style="white-space:nowrap">
         ${isBlocked
           ? `<button class="tbtn" style="color:var(--green);border-color:var(--green);
@@ -4393,17 +4740,17 @@ function renderAlerts(){
 
 function alertHtml(a){
   const c=sev2col(a.severity);
-  return `<div class="alert-card ${a.ack?'acked':''}" id="al-${a.id}">
+  return `<div class="alert-card ${a.ack?'acked':''}" id="al-${esc(a.id)}">
     <div class="alert-bar" style="background:${c}"></div>
     <div style="flex:1">
       <div style="display:flex;align-items:center;gap:7px">
-        <span class="badge-sev sev-${a.severity}">${a.severity}</span>
-        <span class="alert-title">${a.title}</span>
+        <span class="badge-sev sev-${esc(a.severity)}">${esc(a.severity)}</span>
+        <span class="alert-title">${esc(a.title)}</span>
       </div>
-      <div class="alert-detail">${a.detail}</div>
-      <div class="alert-meta"><span class="ip">${a.ip}</span> · ${a.ts}</div>
+      <div class="alert-detail">${esc(a.detail)}</div>
+      <div class="alert-meta"><span class="ip">${esc(a.ip)}</span> · ${esc(a.ts)}</div>
     </div>
-    ${!a.ack?`<button class="ack-btn" onclick="ack('${a.id}',event)">✓ ACK</button>`
+    ${!a.ack?`<button class="ack-btn" onclick="ack('${esc(a.id)}',event)">✓ ACK</button>`
             :`<span style="font-size:9px;color:var(--muted)">ACKed</span>`}
   </div>`;
 }
@@ -4417,13 +4764,13 @@ function renderVulns(){
       <div class="alert-bar" style="background:${sev2col(v.severity)}"></div>
       <div style="flex:1">
         <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
-          <span class="badge-sev sev-${v.severity}">${v.severity}</span>
-          <strong>${v.service}</strong>
+          <span class="badge-sev sev-${esc(v.severity)}">${esc(v.severity)}</span>
+          <strong>${esc(v.service)}</strong>
           ${v.port?`<span class="mono" style="color:var(--accent2);font-size:11px">:${v.port}</span>`:""}
-          <span class="ip" style="font-size:11px;margin-left:auto">${v.ip}</span>
+          <span class="ip" style="font-size:11px;margin-left:auto">${esc(v.ip)}</span>
         </div>
-        <div class="alert-detail">${v.description}</div>
-        ${v.version?`<div style="font-size:10px;color:var(--muted);margin-top:2px">ver: ${v.version}</div>`:""}
+        <div class="alert-detail">${esc(v.description)}</div>
+        ${v.version?`<div style="font-size:10px;color:var(--muted);margin-top:2px">ver: ${esc(v.version)}</div>`:""}
       </div>
     </div>`).join("")
     :"<div style='color:var(--muted);padding:16px'>No vulnerabilities detected yet.</div>";
@@ -4439,7 +4786,7 @@ function renderPorts(){
     html+=`<div style="margin-bottom:18px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <span class="ip">${d.ip}</span>
-        <span style="color:var(--muted);font-size:10px">${d.vendor||""} – ${d.device_type||""}</span>
+        <span style="color:var(--muted);font-size:10px">${esc(d.vendor||"")} – ${esc(d.device_type||"")}</span>
         <span class="os-badge" style="margin-left:auto">${(()=>{const r=resolveOsDisplay(d.os,d.ttl);return (r.icon?r.icon+" ":"")+r.text;})()}</span>
       </div>
       <div class="port-grid">
@@ -4448,8 +4795,8 @@ function renderPorts(){
           const s=vp?vp[1]:"LOW";
           return `<div class="port-card">
             <div class="port-num">${p}</div>
-            <div><div class="port-svc">${i.service||"unknown"} <span class="badge-sev sev-${s}" style="font-size:8px">${s}</span></div>
-            <div class="port-ver">${i.version||i.protocol||""}</div></div></div>`;
+            <div><div class="port-svc">${esc(i.service||"unknown")} <span class="badge-sev sev-${s}" style="font-size:8px">${s}</span></div>
+            <div class="port-ver">${esc(i.version||i.protocol||"")}</div></div></div>`;
         }).join("")}
       </div></div>`;
   });
@@ -4460,15 +4807,26 @@ function filterPorts(){renderPorts();}
 // ── Bandwidth graphs ──────────────────────────────────────────────────────
 function renderGraphs(){
   const c=document.getElementById("graphs-content");
+  if(!c) return;
   Object.values(S.devices).filter(d=>d.status==="online").forEach(d=>{
     const cid="bwc-"+d.ip.replace(/\./g,"-");
     if(!document.getElementById(cid)){
       const wrap=document.createElement("div");
       wrap.className="chart-card";
-      wrap.innerHTML=`<div class="chart-lbl">${d.ip} – ${d.vendor||d.device_type||"Device"}
+      wrap.dataset.ip=d.ip;
+      wrap.innerHTML=`<div class="chart-lbl">${d.ip} – ${esc(d.vendor||d.device_type||"Device")}
         <span class="os-badge" style="margin-left:8px;font-size:9px">${(()=>{const r=resolveOsDisplay(d.os,d.ttl);return (r.icon?r.icon+" ":"")+r.text.substring(0,20);})()}</span></div>
         <canvas id="${cid}" height="70"></canvas>`;
       c.appendChild(wrap);
+    }
+  });
+  // Drop cards (and their Chart instances) for devices that are no longer online
+  c.querySelectorAll(".chart-card").forEach(w=>{
+    const ip=w.dataset.ip;
+    const dev=S.devices[ip];
+    if(!dev || dev.status!=="online"){
+      if(devCharts[ip]){ devCharts[ip].destroy(); delete devCharts[ip]; }
+      w.remove();
     }
   });
 }
@@ -4500,29 +4858,43 @@ function updateDevCharts(upd){
 }
 
 // ── Packet stream ─────────────────────────────────────────────────────────
+let _lastPsutilPkt = 0;   // last RECV/SEND (psutil NIC poller) timestamp
 function addPkt(p){
   pktTotal++;
-  if(["RECV","SEND"].includes(p.proto)) capMode="psutil";
-  else if(!capMode&&["TCP","UDP","ICMP"].includes(p.proto)) capMode="scapy";
+  // Truthful capture-mode badge: RECV/SEND events come only from the psutil
+  // NIC poller, so while they're recent we're in psutil mode. Transport-level
+  // packets (TCP/UDP/ICMP/ICMPv6/ARP) mean deep capture ONLY if no psutil
+  // poll has been seen recently (the no-root fallback also synthesises
+  // TCP/UDP events from the socket table).
+  if(["RECV","SEND"].includes(p.proto)) _lastPsutilPkt = Date.now();
+  if(["TCP","UDP","ICMP","ICMPv6","ARP"].includes(p.proto))
+    capMode = (Date.now() - _lastPsutilPkt < 5000) ? "psutil" : "scapy";
   const ph=document.getElementById("pkt-ph");
   if(ph) ph.remove();
   el("pkt-ctr", pktTotal.toLocaleString()+" pkts");
   if(pktTotal%30===1){
     const b=document.getElementById("cap-badge");
     if(b){
-      if(capMode==="scapy"){b.textContent="🔴 Scapy (root)";b.style.color="var(--green)";}
-      else{b.textContent="🟡 psutil";b.style.color="var(--yellow)";}
+      if(capMode==="scapy"){
+        b.textContent="🔴 Scapy full capture (root)";b.style.color="var(--green)";
+        const note=document.getElementById("cap-note");
+        if(note) note.textContent="IPv4 · IPv6 · ARP — TCP, UDP, ICMP, ICMPv6 + others";
+      } else {
+        b.textContent="🟡 psutil — TCP/UDP only (run as root for full capture)";b.style.color="var(--yellow)";
+        const note=document.getElementById("cap-note");
+        if(note) note.textContent="psutil socket poll: TCP/UDP only";
+      }
     }
   }
   const s=document.getElementById("pkt-stream");
   const d=document.createElement("div");
   d.className="pkt";
-  d.innerHTML=`<span class="pkt-ts">${p.ts}</span>`+
-    `<span class="pkt-proto pkt-${p.proto}">${p.proto}</span>`+
-    `<span class="pkt-src">${p.src}</span>`+
+  d.innerHTML=`<span class="pkt-ts">${esc(p.ts)}</span>`+
+    `<span class="pkt-proto pkt-${esc(p.proto)}">${esc(p.proto)}</span>`+
+    `<span class="pkt-src">${esc(p.src)}</span>`+
     `<span style="color:var(--muted)">→</span>`+
-    `<span class="pkt-dst">${p.dst}</span>`+
-    `<span class="pkt-info">${p.info||""}</span>`+
+    `<span class="pkt-dst">${esc(p.dst)}</span>`+
+    `<span class="pkt-info">${esc(p.info||"")}</span>`+
     `<span style="color:var(--muted);margin-left:auto;white-space:nowrap">${fmt(p.len)}</span>`;
   s.insertBefore(d, s.firstChild);
   if(s.children.length>500) s.removeChild(s.lastChild);
@@ -4546,11 +4918,11 @@ function openModal(ip){
   const vulns=d.vulnerabilities||[];
   document.getElementById("modal-body").innerHTML=`
     <div class="detail-grid">
-      ${kv("IP",d.ip)} ${kv("MAC",d.mac||"N/A")} ${kv("Hostname",d.hostname||"N/A")}
-      ${kv("Vendor",d.vendor||"Unknown")} ${kv("Brand",d.brand||"Unknown")} ${kv("Type",d.device_type||"Unknown")}
+      ${kv("IP",d.ip)} ${kv("MAC",esc(d.mac||"N/A"))} ${kv("Hostname",esc(d.hostname||"N/A"))}
+      ${kv("Vendor",esc(d.vendor||"Unknown"))} ${kv("Brand",esc(d.brand||"Unknown"))} ${kv("Type",esc(d.device_type||"Unknown"))}
       ${kv("OS",(()=>{const r=resolveOsDisplay(d.os,d.ttl);return (r.icon?r.icon+" ":"")+r.text;})())}
-      ${kv("OS Accuracy",d.os_accuracy||"N/A")} ${kv("TTL",d.ttl||"N/A")}
-      ${kv("Status",d.status||"offline")} ${kv("First Seen",d.first_seen||"N/A")} ${kv("Last Seen",d.last_seen||"N/A")}
+      ${kv("OS Accuracy",esc(d.os_accuracy||"N/A"))} ${kv("TTL",d.ttl||"N/A")}
+      ${kv("Status",esc(d.status||"offline"))} ${kv("First Seen",esc(d.first_seen||"N/A"))} ${kv("Last Seen",esc(d.last_seen||"N/A"))}
       ${kv("Traffic In",fmt(d.bytes_in||0))} ${kv("Traffic Out",fmt(d.bytes_out||0))}
     </div>
     <div class="chart-card"><div class="chart-lbl">Bandwidth – last 60s</div>
@@ -4561,8 +4933,8 @@ function openModal(ip){
       <div class="port-grid">
         ${ports.map(([p,i])=>`<div class="port-card">
           <div class="port-num">${p}</div>
-          <div><div class="port-svc">${i.service||"unknown"}</div>
-          <div class="port-ver">${i.version||""}</div></div></div>`).join("")
+          <div><div class="port-svc">${esc(i.service||"unknown")}</div>
+          <div class="port-ver">${esc(i.version||"")}</div></div></div>`).join("")
           ||"<span style='color:var(--muted);font-size:11px'>No open ports</span>"}
       </div>
     </div>
@@ -4572,11 +4944,11 @@ function openModal(ip){
       ${vulns.map(v=>`<div class="alert-card" style="margin-bottom:7px">
         <div class="alert-bar" style="background:${sev2col(v.severity)}"></div>
         <div><div style="display:flex;gap:6px;align-items:center">
-          <span class="badge-sev sev-${v.severity}">${v.severity}</span>
-          <strong>${v.service}</strong>
+          <span class="badge-sev sev-${esc(v.severity)}">${esc(v.severity)}</span>
+          <strong>${esc(v.service)}</strong>
           ${v.port?`<span class="mono" style="color:var(--accent2);font-size:11px">:${v.port}</span>`:""}
         </div>
-        <div class="alert-detail">${v.description}</div></div></div>`).join("")
+        <div class="alert-detail">${esc(v.description)}</div></div></div>`).join("")
         ||"<span style='color:var(--low);font-size:11px'>✓ No vulnerabilities</span>"}
     </div>`;
   fetch(`/api/traffic/${ip}`).then(r=>r.json()).then(td=>{
@@ -4598,7 +4970,7 @@ function openModal(ip){
 function closeModal(){document.getElementById("modal-overlay").classList.remove("open");curModal=null;}
 function rescan(){
   if(!curModal) return;
-  fetch(`/api/rescan/${curModal}`,{method:"POST"}).then(r=>r.json())
+  authFetch(`/api/rescan/${curModal}`, {method:"POST"}).then(r=>r.json())
     .then(d=>toast({title:"Rescan Queued",detail:d.message||"",severity:"INFO"}));
 }
 document.getElementById("modal-overlay").addEventListener("click",function(e){if(e.target===this)closeModal();});
@@ -4606,13 +4978,13 @@ document.getElementById("modal-overlay").addEventListener("click",function(e){if
 // ── Alerts ────────────────────────────────────────────────────────────────
 function ack(id,e){
   e.stopPropagation();
-  fetch(`/api/alerts/ack/${id}`,{method:"POST"}).then(()=>{
+  authFetch(`/api/alerts/ack/${id}`,{method:"POST"}).then(()=>{
     const a=S.alerts.find(x=>x.id===id);if(a)a.ack=true;
     renderAlerts();renderOvAlerts();badge();
   });
 }
 function ackAll(){
-  S.alerts.filter(a=>!a.ack).forEach(a=>{fetch(`/api/alerts/ack/${a.id}`,{method:"POST"});a.ack=true;});
+  S.alerts.filter(a=>!a.ack).forEach(a=>{authFetch(`/api/alerts/ack/${a.id}`,{method:"POST"});a.ack=true;});
   renderAlerts();badge();
 }
 function badge(){
@@ -4627,8 +4999,8 @@ function toast(a){
   const c=document.getElementById("toasts");
   const d=document.createElement("div");d.className="toast";
   d.innerHTML=`<div class="toast-bar" style="background:${sev2col(a.severity||'INFO')}"></div>
-    <div><div style="font-weight:600;font-size:12px">${a.title||""}</div>
-    <div style="font-size:10px;color:var(--muted);margin-top:2px">${(a.detail||"").substring(0,80)}</div></div>`;
+    <div><div style="font-weight:600;font-size:12px">${esc(a.title||"")}</div>
+    <div style="font-size:10px;color:var(--muted);margin-top:2px">${esc((a.detail||"").substring(0,80))}</div></div>`;
   c.appendChild(d);
   setTimeout(()=>{d.style.opacity="0";d.style.transform="translateX(110%)";setTimeout(()=>d.remove(),400);},5000);
 }
@@ -4679,10 +5051,10 @@ function runSpeedTest() {
   // Animated progress (fake, since we can't stream from server)
   _spdProgress = 0;
   const phases = [
-    [8,  "🔍 Locating nearest test server…"],
-    [22, "📡 Measuring latency & jitter (10 probes)…"],
-    [42, "⬇ Testing download speed (multi-stream)…"],
-    [70, "⬆ Testing upload speed…"],
+    [8,  "🔍 Starting speed test…"],
+    [22, "📡 Measuring latency…"],
+    [42, "⬇ Downloading test data…"],
+    [70, "⬆ Uploading test data…"],
     [92, "📊 Computing results…"],
   ];
   let phaseIdx = 0;
@@ -4767,16 +5139,16 @@ function runSpeedTest() {
     // Meta info
     // Engine badge — show which measurement method was used
     const isCli = (d.status||"").includes("speedtest-cli");
-    const isAccurate = isCli || (d.status||"").includes("accurate");
+    const isProbe = isCli || (d.status||"").includes("HTTP probe");
     const engine = isCli ? "speedtest-cli ✓" :
-                   isAccurate ? "HTTP probe (accurate) ✓" : d.status || "unknown";
+                   isProbe ? "HTTP probe ✓" : d.status || "unknown";
     const engineEl = document.getElementById("spd-engine");
     if (engineEl) {
       engineEl.textContent = engine;
-      const eCol = isCli ? "var(--green)" : isAccurate ? "var(--accent)" : "var(--yellow)";
+      const eCol = isCli ? "var(--green)" : isProbe ? "var(--accent)" : "var(--yellow)";
       engineEl.style.color = eCol;
       engineEl.style.borderColor = isCli ? "rgba(0,230,118,.3)" :
-                                   isAccurate ? "rgba(0,229,255,.3)" : "rgba(255,215,64,.3)";
+                                   isProbe ? "rgba(0,229,255,.3)" : "rgba(255,215,64,.3)";
     }
     if (d.server) el("spd-server", "📍 " + d.server);
     if (d.isp)    el("spd-isp",    "🌐 " + d.isp);
@@ -4802,7 +5174,7 @@ function blockDevice(ip, e){
   const d = S.devices[ip];
   const isBlocked = d && d.blocked;
   const url = isBlocked ? `/api/unblock/${ip}` : `/api/block/${ip}`;
-  fetch(url, {method:"POST"}).then(r=>r.json()).then(res=>{
+  authFetch(url, {method:"POST"}).then(r=>r.json()).then(res=>{
     toast({title: isBlocked?"Device Unblocked":"Device Blocked",
            detail: res.message||"", severity: isBlocked?"INFO":"HIGH"});
     if(S.devices[ip]) S.devices[ip].blocked = !isBlocked;
@@ -4942,6 +5314,9 @@ const ACT_PROTO_COLORS = {
   TCP:            '#00e5ff',
   UDP:            '#7c4dff',
   DNS:            '#ff6b35',
+  ICMPv6:         '#4dd0e1',
+  ARP:            '#9e9e9e',
+  IPv6:           '#b0a8e0',
   OTHER:          '#90a4ae',
 };
 
@@ -4972,10 +5347,10 @@ function actRefreshDeviceGrid() {
              min-width:120px;transition:all .15s"
       onmouseover="this.style.borderColor='var(--accent)'"
       onmouseout="this.style.borderColor='${sel?'var(--accent)':'var(--border)'}'"
-      id="act-chip-${d.ip.replace(/\\./g,'-')}">
+      id="act-chip-${d.ip.replace(/\./g,'-')}">
       <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">${d.ip}</div>
       <div style="font-size:9px;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;
-                  white-space:nowrap;max-width:110px" title="${label}">${label.substring(0,14)}</div>
+                  white-space:nowrap;max-width:110px" title="${esc(label)}">${esc(label.substring(0,14))}</div>
       <div style="margin-top:5px;font-size:9px;color:var(--muted)">↑${_fmtAct(bo)} ↓${_fmtAct(bi)}</div>
     </div>`;
   }).join('');
@@ -5130,7 +5505,8 @@ function _actIngestPacket(pkt) {
   if (!data.sites_visited) data.sites_visited = [];
   let site = data.sites_visited.find(s => s.ip === remote);
   if (!site) {
-    data.sites_visited.push({ ip: remote, domain: remote, count: 1, last_seen: pkt.ts });
+    site = { ip: remote, domain: remote, count: 1, last_seen: pkt.ts };
+    data.sites_visited.push(site);
   } else {
     site.count = (site.count||0) + 1;
   }
@@ -5822,20 +6198,6 @@ function actInit() {
   actRefreshDeviceGrid();
 }
 
-// Refresh device grid when devices panel updates
-socket.on("device_update", () => {
-  if (active("activities")) actRefreshDeviceGrid();
-});
-
-// ── Real-time packet feed ────────────────────────────────────────────────
-socket.on("live_packet", pkt => {
-  if (!ACT_STATE.currentIP || ACT_STATE.paused) return;
-  if (pkt.src === ACT_STATE.currentIP || pkt.dst === ACT_STATE.currentIP) {
-    ACT_STATE._pktBuf.push(pkt);
-    if (ACT_STATE._pktBuf.length > 500) ACT_STATE._pktBuf.splice(0, 100);
-  }
-});
-
 // Clock
 setInterval(()=>{const e=document.getElementById("hdr-time");if(e)e.textContent=new Date().toLocaleTimeString();},1000);
 
@@ -5846,7 +6208,7 @@ setInterval(()=>{const e=document.getElementById("hdr-time");if(e)e.textContent=
 
 @app.route("/")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(DASHBOARD_HTML, auth_token=AUTH_TOKEN)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5857,9 +6219,9 @@ def print_banner():
     cap  = ("Scapy deep-capture" if (SCAPY_OK and IS_ROOT)
             else "psutil poll (install scapy + run as root for deep capture)")
     print(f"""
-\u256c{'\u2550'*50}\u256c
-\u2551     NetSentinel v{VERSION} - Network Security       \u2551
-\u2569{'\u2550'*50}\u256f
+╔{'═'*50}╗
+║     Netron v{VERSION} - Network Security       ║
+╚{'═'*50}╝
   Gateway  : {monitor.gateway}
   Network  : {monitor.network}
   Mode     : {mode}
@@ -5870,12 +6232,12 @@ def print_banner():
 if __name__ == "__main__":
     if not IS_ROOT:
         print("\n[!] Not root - packet capture uses psutil, OS detect uses heuristics.")
-        print("    For full features: sudo python3 network_manager.py\n")
+        print("    For full features: sudo python3 netron.py\n")
     monitor.start()
     print_banner()
     print("  Press Ctrl+C to stop.\n")
     try:
-        socketio.run(app, host="0.0.0.0", port=APP_PORT,
+        socketio.run(app, host=APP_HOST, port=APP_PORT,
                      debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
     except KeyboardInterrupt:
         print("\n[!] Shutting down...")
