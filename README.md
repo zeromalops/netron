@@ -70,7 +70,7 @@
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/maulezero/netron.git
+git clone https://github.com/zeromalops/netron.git
 ```
 
 ### 2. Navigate into the Project
@@ -83,16 +83,9 @@ cd netron
 
 No virtual environment is included in the repo — create one first.
 
-**macOS / Linux:**
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-**Windows:**
-```bash
-python -m venv venv
-venv\Scripts\activate
 ```
 
 ### 4. Install Dependencies
@@ -158,15 +151,17 @@ faked**: `/api/detections` reports them as inactive with the missing telemetry.
 
 ## ▶️ Usage
 
-**macOS / Linux:**
+Run the server with `sudo` — that is the full-feature mode: live packet capture
+via Scapy (all 40 capture rules, per-device bandwidth from real packet bytes,
+RTP/RTCP media labelling), plus OS detection and ARP-based device discovery.
+
 ```bash
-python3 netron.py
+sudo python3 netron.py
 ```
 
-**Windows:**
-```bash
-python netron.py
-```
+Without `sudo` Netron still starts and detects devices, but capture falls back to
+psutil flow polling: no packet payloads, so bandwidth and the capture-based rules
+show as unavailable instead of estimated.
 
 Then open your browser and navigate to:
 
@@ -213,7 +208,7 @@ Created at runtime (not in the repo):
 | `nmap` binary on `PATH` | Service/version names on every discovered open port, OS detection; without it only the built-in TCP-connect fallback runs |
 | `rustscan` binary on `PATH` | Fast port discovery in front of nmap; without it nmap does discovery as well. `-t 3000 --tries 2` are fixed: the default 1500 ms timeout was measured dropping real open ports |
 | `pip install speedtest-cli` | Measure against the speedtest.net node chosen for you; without it the built-in Cloudflare multi-stream probe is used |
-| `libpcap` (Linux/macOS) or Npcap (Windows) | Required by Scapy for live packet capture |
+| `libpcap` (Linux/macOS) | Required by Scapy for live packet capture |
 
 ### Configuration
 
@@ -265,7 +260,7 @@ Pull requests are welcome. For major changes, please open an issue first to disc
 
 ## 📄 License
 
-MIT © [github.com/maulezero](https://github.com/maulezero) — see [LICENSE](LICENSE).
+MIT © [github.com/zeromalops](https://github.com/zeromalops) — see [LICENSE](LICENSE).
 
 ---
 
