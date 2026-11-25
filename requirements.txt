@@ -1,3 +1,7 @@
+# Optional extras (not installed by this file):
+#   speedtest-cli   -> real download/upload measurement for the speedtest panel
+#   nmap binary on PATH -> port / service / OS scanning (system package)
+#   libpcap / Npcap -> required by Scapy for live packet capture (system package)
 bidict==0.23.1
 blinker==1.9.0
 click==8.3.3

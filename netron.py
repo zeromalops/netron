@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Netron v3.0 - Advanced Network Management & Security Dashboard
+Netron - Advanced Network Management & Security Dashboard
 
 Install:
     pip install scapy psutil netifaces requests flask flask-socketio python-nmap
@@ -13,12 +13,12 @@ Open http://localhost:5000 in your browser (override with the
 NETRON_HOST / NETRON_PORT environment variables).
 """
 
-import functools, os, secrets, sys, re, time, socket, threading, subprocess, ipaddress
-import hashlib, logging, platform
+import functools, os, queue, secrets, shutil, sys, re, time, socket, threading, subprocess, ipaddress
+import hashlib, json, logging, math, platform, ssl, statistics, struct
 from datetime import datetime
 from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Root detection (safe on Windows too) ──────────────────────────────────────
 IS_ROOT = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
@@ -33,7 +33,8 @@ try:
 except ImportError:
     sys.exit("Missing: pip install netifaces")
 try:
-    from flask import Flask, render_template_string, jsonify, request, Response
+    from flask import (Flask, render_template_string, jsonify, request, Response,
+                       send_from_directory)
     from flask_socketio import SocketIO, emit
 except ImportError:
     sys.exit("Missing: pip install flask flask-socketio")
@@ -55,7 +56,8 @@ logging.getLogger("scapy.loading").setLevel(logging.CRITICAL)
 try:
     import scapy.config
     scapy.config.conf.verb = 0          # suppress scapy output
-    from scapy.all import sniff, ARP, Ether, IP, IPv6, TCP, UDP, ICMP, DNS, DNSQR, srp
+    from scapy.all import (sniff, ARP, Ether, IP, IPv6, TCP, UDP, ICMP, DNS, DNSQR,
+                           DNSRR, BOOTP, DHCP, Dot1Q, Raw, srp)
     SCAPY_OK = True
 except Exception:
     SCAPY_OK = False
@@ -73,10 +75,73 @@ VERSION        = "3.0.1"
 APP_HOST       = os.environ.get("NETRON_HOST", "0.0.0.0")
 APP_PORT       = int(os.environ.get("NETRON_PORT", "5000"))
 SCAN_INTERVAL  = 15          # seconds between full sweeps (fast for quick detection)
+VULN_INTERVAL  = int(os.environ.get("NETRON_VULN_INTERVAL", "60"))
+# Full identification (PTR/mDNS/NetBIOS name, banner, OS, vendor API) is the
+# expensive part of a scan, so it is refreshed on this slower cadence. Ports
+# and vulnerabilities are refreshed by the parallel sweep (VULN_INTERVAL).
+ID_INTERVAL    = int(os.environ.get("NETRON_ID_INTERVAL", "300"))
+SCAN_WORKERS   = int(os.environ.get("NETRON_SCAN_WORKERS", "24"))   # concurrent deep scans
+VULN_WORKERS   = int(os.environ.get("NETRON_VULN_WORKERS", "16"))   # concurrent vuln scans
 MAX_PKTS       = 400         # per-device packet log size
+PKT_FEED_MAX   = 3000        # global Wireshark-style packet feed size
 ANOMALY_THRESH = 50          # SYN packets before flood alert
 ARP_GRACE_SECS = 90          # keep a device "online" this long after its last ARP sighting
 EMIT_RATE_PPS  = 25          # max live_packet/topo_packet socket events per second
+DEVICE_RETENTION_SECS = 3600 # drop devices offline longer than this (memory bound)
+SITE_ICONS_ENABLED = os.environ.get("NETRON_SITE_ICONS", "0") == "1"
+SPEEDTEST_CACHE_SECS = 60    # reuse a speed-test result for this long
+
+# Shared TCP connect-scan pool. A per-call pool inside the deep-scan pool
+# would allow workers × ports threads at once; this caps it globally.
+_TCP_POOL = ThreadPoolExecutor(max_workers=96, thread_name_prefix="tcp")
+# Shared pool for the fast ARP-cache registration path (reused instead of
+# spawning a new pool every 3-second ARP poll).
+_ARP_POOL  = ThreadPoolExecutor(max_workers=4, thread_name_prefix="seed")
+# Consecutive empty port sweeps per host.  One empty re-scan does not prove a
+# host's ports closed (Wi-Fi hosts drop probes while asleep), so the last
+# observed ports are kept until three sweeps in a row come back empty.
+_VULN_EMPTY: Dict[str, int] = {}
+# How long a port that was seen open stays on screen when a later sweep misses
+# it (a Wi-Fi host answers unevenly).  After this it is dropped: the UI never
+# shows a port as open that nothing has confirmed for this long.
+PORT_RETENTION_SECS = int(os.environ.get("NETRON_PORT_RETENTION", "900"))
+
+# ── RustScan (optional port-discovery front end) ──────────────────────────────
+# rustscan probes a port range far faster than nmap, then nmap runs -sV on just
+# the ports it reported, so service names still come from a real nmap probe.
+# Timeout/tries are not tunable-by-default for speed: measured on the live Wi-Fi
+# LAN, rustscan's default -t 1500 silently missed open ports (a host that answers
+# 22,53,80,9000-9006 came back as [22,53,80] one run and [9004] the next), which
+# would have dropped real findings.  -t 3000 --tries 2 returned the full set on
+# every run, so those values are fixed here.
+RUSTSCAN_BIN      = os.environ.get("NETRON_RUSTSCAN_BIN") or shutil.which("rustscan") or ""
+RUSTSCAN_OK       = bool(RUSTSCAN_BIN)
+RUSTSCAN_BATCH    = "4500"
+RUSTSCAN_TIMEOUT  = "3000"      # ms, per probe
+RUSTSCAN_TRIES    = "2"
+# Extra range probed on top of SCAN_PORTS.  Empty = SCAN_PORTS only (the fast
+# 60 s sweep).  Set e.g. NETRON_RUSTSCAN_RANGE=1-2000 to widen discovery; a full
+# 1-65535 scan of one host measured ~91 s on this Wi-Fi, so it is opt-in.
+RUSTSCAN_RANGE    = (os.environ.get("NETRON_RUSTSCAN_RANGE", "") or "").strip()
+# Hard ceiling for one rustscan invocation: SCAN_PORTS takes ~3 s, a full-range
+# scan ~91 s; anything beyond this is treated as a failed scan, not "no ports".
+RUSTSCAN_DEADLINE = float(os.environ.get("NETRON_RUSTSCAN_TIMEOUT", "180"))
+
+_RUSTSCAN_FAILURES = 0
+
+
+def _rustscan_failed(reason: str) -> None:
+    """Report a rustscan failure and stop using it after three in a row.
+
+    A broken binary must not make every host look portless: after three failures
+    the scanner falls back to the nmap path for the rest of the run.
+    """
+    global RUSTSCAN_OK, _RUSTSCAN_FAILURES
+    _RUSTSCAN_FAILURES += 1
+    if _RUSTSCAN_FAILURES <= 3:
+        print(f"[Netron] rustscan failed ({reason}) — falling back to nmap")
+    if _RUSTSCAN_FAILURES >= 3:
+        RUSTSCAN_OK = False
 
 VULNERABLE_PORTS = {
     21:   ("FTP",          "MEDIUM",   "Unencrypted file transfer – credentials in plaintext"),
@@ -98,16 +163,73 @@ VULNERABLE_PORTS = {
     514:  ("rsh",          "CRITICAL", "Remote shell – no authentication"),
     1433: ("MSSQL",        "HIGH",     "SQL Server – brute-force / injection risk"),
     1521: ("Oracle",       "HIGH",     "Oracle DB – exposed to network"),
+    2375: ("Docker API",   "CRITICAL", "Docker daemon API – often unauthenticated, remote code execution"),
     3306: ("MySQL",        "HIGH",     "MySQL – exposed to network"),
     3389: ("RDP",          "HIGH",     "Remote Desktop – BlueKeep / brute-force"),
     5432: ("PostgreSQL",   "HIGH",     "PostgreSQL – exposed to network"),
     5900: ("VNC",          "HIGH",     "VNC – weak authentication, unencrypted"),
+    5984: ("CouchDB",      "CRITICAL", "CouchDB HTTP API – often unauthenticated, remote code exec via _config"),
+    5985: ("WinRM",        "HIGH",     "Windows Remote Management (HTTP) – remote-exec / credential surface"),
+    5986: ("WinRM-TLS",    "HIGH",     "Windows Remote Management (HTTPS) – remote-exec / credential surface"),
     6379: ("Redis",        "CRITICAL", "Redis – often no auth, remote code exec"),
     8080: ("HTTP-Alt",     "MEDIUM",   "Alternate HTTP – unencrypted"),
+    8086: ("InfluxDB",     "HIGH",     "InfluxDB HTTP API – often unauthenticated"),
+    11211:("Memcached",    "HIGH",     "Memcached – unauthenticated, data exposure / amplification"),
     8443: ("HTTPS-Alt",    "LOW",      "Alternate HTTPS"),
     9200: ("Elasticsearch","CRITICAL", "Elasticsearch – often unauthenticated"),
     27017:("MongoDB",      "CRITICAL", "MongoDB – often unauthenticated"),
 }
+
+# Ports every scan probes. One list for both nmap and the TCP-connect fallback,
+# so a host's findings never depend on which scanner happened to run. It is the
+# union of the service ports the UI reports and every port assess_vulns() knows
+# how to rate.
+SCAN_PORTS: Tuple[int, ...] = tuple(sorted({
+    21, 22, 23, 25, 53, 80, 81, 82, 83, 84, 85, 86, 87, 88, 110, 111, 135,
+    137, 139, 143, 161, 389, 443, 445, 512, 513, 514, 515, 548, 554, 587,
+    623, 631, 636, 873, 902, 993, 995, 1080, 1433, 1521, 1883, 1935, 2049,
+    2375, 3128, 3268, 3269, 3306, 3389, 4840, 5060, 5353, 5432, 5555, 5683,
+    5900, 5901, 5902, 5984, 5985, 5986, 62078, 6379, 7474, 8000, 8008, 8080,
+    8081, 8086, 8087, 8088, 8090, 8443, 8554, 8883, 8888, 8899, 9000, 9090,
+    9100, 9200, 9443, 11211, 27017, 28017,
+}))
+
+# Fallback service labels for ports where neither nmap nor socket.getservbyport
+# yields a name (the TCP-connect fallback runs without nmap, and /etc/services
+# is missing many modern ports).  These are the IANA/registered names, not
+# guesses, and are only used when the scan produced no name of its own.
+PORT_SERVICES: Dict[int, str] = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "domain",
+    80: "http", 81: "http", 82: "http", 83: "http", 84: "http",
+    85: "http", 86: "http", 87: "http", 88: "kerberos", 110: "pop3",
+    111: "rpcbind", 135: "msrpc", 137: "netbios-ns", 139: "netbios-ssn",
+    143: "imap", 161: "snmp", 389: "ldap", 443: "https", 445: "microsoft-ds",
+    512: "exec", 513: "login", 514: "shell", 515: "printer", 548: "afp",
+    554: "rtsp", 587: "submission", 623: "asf-rmcp", 631: "ipp",
+    636: "ldaps", 873: "rsync", 902: "vmware-auth", 993: "imaps",
+    995: "pop3s", 1080: "socks", 1433: "ms-sql-s", 1521: "oracle",
+    1883: "mqtt", 1935: "rtmp", 2049: "nfs", 2375: "docker",
+    3128: "squid-http", 3268: "ldap-gc", 3269: "ldaps-gc", 3306: "mysql",
+    3389: "ms-wbt-server", 4840: "opcua", 5060: "sip", 5353: "mdns",
+    5432: "postgresql", 5555: "adb", 5683: "coap", 5900: "vnc",
+    5901: "vnc-1", 5902: "vnc-2", 5984: "couchdb", 5985: "wsman",
+    5986: "wsmans", 62078: "iphone-sync", 6379: "redis", 7474: "neo4j",
+    8000: "http-alt", 8008: "http", 8080: "http-alt", 8081: "http",
+    8086: "influxdb", 8087: "http", 8088: "http", 8090: "http",
+    8443: "https-alt", 8554: "rtsp-alt", 8883: "mqtts", 8888: "http",
+    8899: "http", 9000: "cslistener", 9090: "zeus-admin", 9100: "jetdirect",
+    9200: "elasticsearch", 9443: "https-alt", 11211: "memcache",
+    27017: "mongod", 28017: "mongod-http",
+}
+
+
+def service_label(port: int, detected: str = "") -> str:
+    """Service name for a port: what the scan identified, else the registered
+    name for that port number.  Never invents a product or version."""
+    detected = (detected or "").strip()
+    if detected and detected.lower() not in ("unknown", "tcp", "udp", "?"):
+        return detected
+    return PORT_SERVICES.get(port, "unknown")
 
 # ── OUI vendor table  (expanded – 120+ entries) ─────────────────────────────
 # Format: OUI → (vendor, device_type, brand)
@@ -322,7 +444,7 @@ OUI_TABLE: Dict[str, Tuple[str,str,str]] = {
     "C0:FF:D4":("Netgear","Router/AP","Netgear"), "E4:F4:C6":("Netgear","Router/AP","Netgear"),
     # ── Google / Android / Nest ─────────────────────────────────────────────
     "B0:4E:26":("Google","Chromecast","Google"),  "54:60:09":("Google","Chromecast","Google"),
-    "6C:AD:F8":("Google","Chromecast","Google"),  "AA:01:37":("Google","Chromecast","Google"),
+    "6C:AD:F8":("Google","Chromecast","Google"),  "F4:F5:E8":("Google","Chromecast","Google"),
     "18:B4:30":("Nest","Smart Home","Google"),    "20:7B:D2":("Google","Google Home","Google"),
     "3C:28:6D":("Google","Pixel Phone","Google"),
     "D0:E7:82":("Google","Pixel Phone","Google"), "F4:F5:D8":("Google","Pixel Phone","Google"),
@@ -461,8 +583,10 @@ def _os_from_ttl(ttl: int) -> Tuple[str, str]:
 devices:      Dict[str, dict]           = {}
 traffic_data: Dict[str, deque]          = defaultdict(lambda: deque(maxlen=120))
 packet_log:   Dict[str, deque]          = defaultdict(lambda: deque(maxlen=MAX_PKTS))
-alerts:       deque                     = deque(maxlen=200)
-syn_counters: Dict[str, int]            = defaultdict(int)
+alerts:       deque                     = deque(maxlen=500)
+pkt_feed:     deque                     = deque(maxlen=PKT_FEED_MAX)  # every captured packet, all devices
+SYN_WINDOW_SECS = 10            # SYN-flood detection window
+SYN_MAX_SOURCES = 4096          # hard cap so spoofed sources can't grow the dict forever
 net_stats = dict(total_in=0, total_out=0, pps=0, scan_count=0, alert_count=0)
 _lock = threading.RLock()
 # Consecutive sweeps in which a device was NOT seen by nmap (device is only
@@ -475,7 +599,71 @@ _arp_seen_ts: Dict[str, float] = {}
 #  UTILITY FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 def _ts()  -> str: return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _parse_ts(s) -> float:
+    """Epoch seconds for a `_ts()` string; 0.0 when absent or malformed."""
+    try:
+        return datetime.strptime(str(s), "%Y-%m-%d %H:%M:%S").timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 def _sts() -> str: return datetime.now().strftime("%H:%M:%S")
+
+def merge_scan_ports(ip: str, prev: dict, fresh: dict) -> Tuple[dict, bool]:
+    """The open-port set to show after one scan of `ip`.
+
+    Every scan path (deep identification, vulnerability sweep, re-scan) goes
+    through here, so the Ports panel, the Vulnerabilities panel and the alerts
+    all describe the same set of ports.
+
+    A scan returning nothing is not proof that ports closed -- a sleeping or
+    busy Wi-Fi host drops probes -- so the last observed ports are kept until
+    three consecutive empty sweeps, and any single port that was confirmed
+    open within PORT_RETENTION_SECS survives a sweep that missed it.  A port is
+    only ever shown as open because a scan saw it open, never inferred.
+
+    Returns (ports, carried).  `carried` is True when a shown port was not
+    confirmed by this scan, so the caller re-assesses findings over the whole
+    displayed set instead of only the freshly probed ports.
+    """
+    now  = time.time()
+    prev = prev or {}
+    kept: Dict[int, dict] = {}
+    for p, info in (fresh or {}).items():
+        if not isinstance(info, dict) or info.get("state") != "open":
+            continue
+        try:
+            num = int(p)
+        except (TypeError, ValueError):
+            continue
+        kept[num] = {**info,
+                     "service": service_label(num, info.get("service", "")),
+                     "version": info.get("version", "") or "",
+                     "seen":    _ts()}
+    if kept:
+        _VULN_EMPTY.pop(ip, None)
+        carried = False
+        for p, info in prev.items():
+            if not isinstance(info, dict):
+                continue
+            try:
+                num = int(p)
+            except (TypeError, ValueError):
+                continue
+            if num in kept:
+                continue
+            if not info.get("seen"):
+                # Legacy entry: start its retention clock now.
+                info = {**info, "seen": _ts()}
+            age = now - _parse_ts(info.get("seen"))
+            if 0 <= age <= PORT_RETENTION_SECS:
+                kept[num] = info
+                carried = True
+        return kept, carried
+    # Nothing answered at all this time.
+    streak = _VULN_EMPTY.get(ip, 0) + 1
+    _VULN_EMPTY[ip] = streak
+    if streak >= 3 or not prev:
+        return {}, bool(prev)
+    return prev, True
 
 def _fmt(b: int) -> str:
     if b < 1024:       return f"{b}B"
@@ -493,7 +681,13 @@ def get_local_network() -> Tuple[str, str]:
         net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
         return gw_ip, str(net)
     except Exception:
-        return gw_ip, "192.168.1.0/24"
+        # Keep the advertised network consistent with the real gateway instead
+        # of pairing a live gateway with a made-up 192.168.1.0/24.
+        try:
+            return gw_ip, str(ipaddress.IPv4Network(
+                gw_ip.rsplit(".", 1)[0] + ".0/24", strict=False))
+        except Exception:
+            return gw_ip, "192.168.1.0/24"
 
 def get_local_ips() -> set:
     ips = {"127.0.0.1"}
@@ -508,7 +702,20 @@ def get_local_ips() -> set:
 
 def _primary_local_ip() -> str:
     """Best-effort primary LAN IPv4 (never loopback). Re-resolved on each call
-    so DHCP/VPN changes are picked up."""
+    so DHCP/VPN changes are picked up.
+
+    Uses a UDP connect (no packets are sent) to let the OS pick the address of
+    the outbound interface – taking an arbitrary interface's address used to
+    attribute all NIC traffic to a Docker/VPN address.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
     try:
         return next(iter(get_local_ips() - {"127.0.0.1"}), "0.0.0.0")
     except Exception:
@@ -593,79 +800,337 @@ def _query_oui_api(mac: str, prefix: str) -> Tuple[str,str,str]:
             continue
     return ("Unknown","Unknown","Unknown")
 
+# Live vendor-API work runs on one background thread fed by a queue, so a scan
+# worker never sits in the 1-request/second rate limiter.  The answer is written
+# into the cache and pushed to the matching devices when it arrives.
+_vendor_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+_vendor_queued: set = set()
+_vendor_worker_lock   = threading.Lock()
+_vendor_worker_started = False
+
+def _enqueue_vendor_lookup(mac: str) -> None:
+    """Queue a live vendor lookup for this MAC (deduplicated, non-blocking)."""
+    global _vendor_worker_started
+    prefix = oui(mac)
+    if not prefix or not REQUESTS_OK:
+        return
+    if prefix in _vendor_queued or prefix in _vendor_cache:
+        return
+    _vendor_queued.add(prefix)
+    _vendor_queue.put((prefix, mac))
+    with _vendor_worker_lock:
+        if not _vendor_worker_started:
+            _vendor_worker_started = True
+            threading.Thread(target=_vendor_worker, daemon=True,
+                             name="vendor-api").start()
+
+def _vendor_worker() -> None:
+    while True:
+        prefix, mac = _vendor_queue.get()
+        try:
+            vendor, dtype, brand = _query_oui_api(mac, prefix)
+            if vendor and vendor.lower() != "unknown":
+                _vendor_cache[prefix] = (vendor, dtype, brand)
+                _vendor_fail_ts.pop(prefix, None)
+                _apply_vendor_result(prefix, vendor, dtype, brand)
+            else:
+                _vendor_fail_ts[prefix] = time.time()
+        except Exception:
+            log.warning("Vendor lookup failed for %s", prefix, exc_info=True)
+        finally:
+            _vendor_queued.discard(prefix)
+            _vendor_queue.task_done()
+
+def _apply_vendor_result(prefix: str, vendor: str, dtype: str, brand: str) -> None:
+    """Attach a late vendor-API answer to the devices already on screen.
+
+    Only fields that are still empty are filled: anything learned from the
+    device itself (banner title, ports, OS) outranks a manufacturer guess.
+    """
+    updated = []
+    with _lock:
+        for d in devices.values():
+            if oui(d.get("mac", "")) != prefix:
+                continue
+            if not d.get("vendor"):
+                d["vendor"] = vendor
+            if not d.get("brand"):
+                d["brand"] = brand
+            if not d.get("device_type"):
+                refined = _refine_dtype(dtype, d.get("vendor", ""), d.get("os", ""),
+                                        d.get("open_ports") or {}, d.get("hostname", ""))
+                if refined and refined.lower() != "unknown":
+                    d["device_type"] = refined
+            updated.append(dict(d))
+    for snap in updated:
+        socketio.emit("device_update", snap)
+
 def lookup_vendor(mac: str) -> Tuple[str,str,str]:
     """
     Return (vendor_name, device_type, brand) from MAC address.
     Lookup order:
-      1. In-memory cache (instant)
-      2. Built-in OUI_TABLE (instant, 300+ brands)
-      3. macvendors.com  (fast REST API, plain-text response)
-      4. maclookup.app   (JSON REST API, fallback)
+      1. Built-in OUI_TABLE (instant, authoritative)
+      2. In-memory cache of earlier API answers
+      3. macvendors.com / maclookup.app — queued on a background thread, so the
+         caller gets "Unknown" now and the device is updated when it answers
     Results are cached. A failed lookup is retried only after
     _VENDOR_RETRY_SECS so offline hosts don't hammer the free APIs.
     """
     prefix = oui(mac)
     if not prefix:
         return "Unknown", "Unknown", "Unknown"
-    # Cache hit
-    if prefix in _vendor_cache:
-        return _vendor_cache[prefix]
-    # Built-in OUI table
+    # Built-in OUI table (authoritative, never expires)
     if prefix in OUI_TABLE:
         entry = OUI_TABLE[prefix]
         _vendor_cache[prefix] = entry
         return entry
-    # Recent failure → serve "Unknown" until the retry window has passed
+    # Successful live lookup → cache it
+    cached = _vendor_cache.get(prefix)
+    if cached is not None:
+        return cached
+    # Recent failure → serve "Unknown" until the retry window has passed.
+    # Failures are deliberately NOT written to _vendor_cache, otherwise the
+    # cache check above would make the retry window unreachable forever.
     fail_ts = _vendor_fail_ts.get(prefix)
     if fail_ts is not None and (time.time() - fail_ts) < _VENDOR_RETRY_SECS:
         return ("Unknown","Unknown","Unknown")
-    # Live API cascade
-    result = _query_oui_api(mac, prefix)
-    _vendor_cache[prefix] = result
-    if result[0] == "Unknown":
-        _vendor_fail_ts[prefix] = time.time()
-    return result
+    _enqueue_vendor_lookup(mac)
+    return ("Unknown","Unknown","Unknown")
 
 def _guess_type(v: str) -> str:
-    """Infer device type from vendor string (used for live API results)."""
-    v = v.lower()
-    # Android phone/tablet brands
-    if any(x in v for x in [
-        "apple", "samsung", "huawei", "xiaomi", "redmi", "poco", "oneplus",
-        "oppo", "realme", "vivo", "iqoo", "infinix", "tecno", "itel",
-        "gionee", "motorola", "nokia mobile", "sony mobile", "htc", "zte",
-        "meizu", "nubia", "blackview", "ulefone", "doogee", "oukitel",
-        "umidigi", "cubot", "blu mobile", "wiko", "micromax", "lava",
-        "karbonn", "symphony", "walton", "fairphone", "nothing",
-    ]):
-        return "Mobile Phone"
-    if any(x in v for x in ["dell", "hp inc", "lenovo", "asus", "acer",
-                             "toshiba", "msi", "fujitsu", "nec laptop"]):
-        return "PC / Laptop"
-    if any(x in v for x in ["cisco", "netgear", "tp-link", "d-link",
-                             "ubiquiti", "mikrotik", "zyxel", "juniper"]):
-        return "Router / Switch"
-    if any(x in v for x in ["raspberry", "arduino", "espressif", "particle"]):
+    """Device type implied by a *manufacturer name alone* (vendor-API results).
+
+    Only vendors whose OUIs are product-homogeneous may map to a type.  Big
+    multi-category vendors (Apple, Samsung, HP, LG, Sony, Lenovo, Microsoft,
+    Google, Amazon, ...) are deliberately NOT mapped: an Apple OUI can be a
+    MacBook, an iPhone or an iPad, so calling it a phone would be a guess, and
+    a wrong guess is worse than "Unknown" here.  Those devices get their type
+    from the OUI table, hostname, ports and OS instead.
+    """
+    v = (v or "").lower()
+    if not v:
+        return "Unknown"
+
+    def has(*names: str) -> bool:
+        return any(re.search(r"\b" + re.escape(n) + r"\b", v) for n in names)
+
+    if has("raspberry", "raspberrypi", "arduino", "espressif", "particle",
+           "beagleboard", "odroid", "hardkernel", "pine64", "espressif systems"):
         return "IoT / SBC"
-    if any(x in v for x in ["vmware", "virtualbox", "qemu", "xen", "parallels"]):
+    if has("vmware", "virtualbox", "qemu", "xen", "parallels", "innotek"):
         return "Virtual Machine"
-    if any(x in v for x in ["amazon", "google home", "sonos", "nest", "ring"]):
+    if has("hikvision", "dahua", "axis", "axis communications", "wyze",
+           "reolink", "amcrest", "foscam", "annke", "lorex", "uniview"):
+        return "IP Camera"
+    if has("cisco", "ubiquiti", "mikrotik", "netgear", "tp-link", "d-link",
+           "zyxel", "juniper", "aruba", "ruckus", "fortinet", "sonicwall",
+           "watchguard", "extreme networks", "meraki", "avm"):
+        return "Router / Switch"
+    if has("brother", "lexmark", "kyocera", "ricoh", "xerox", "konica",
+           "oki", "zebra technologies", "seiko epson"):
+        return "Printer"
+    if has("sonos", "roku", "nest labs", "ecobee", "ring", "tuya", "shelly",
+           "allterco", "lifx", "signify", "philips lighting"):
         return "Smart Device"
-    if any(x in v for x in ["lg", "sony", "tcl", "hisense", "vizio",
-                             "philips", "sharp", "panasonic"]):
+    if has("vizio", "hisense", "sagemcom"):
         return "Smart TV"
     return "Unknown"
 
-def add_alert(ip: str, title: str, detail: str, severity: str = "MEDIUM"):
+# ─────────────────────────────────────────────────────────────────────────────
+#  HOSTNAME RESOLUTION  –  PTR → mDNS → NetBIOS, cached, never raises
+# ─────────────────────────────────────────────────────────────────────────────
+# Most home/SMB subnets have no reverse DNS, so a PTR lookup alone leaves the
+# device name blank.  Apple/IoT/Android hosts answer mDNS and Windows/Samba
+# hosts answer a NetBIOS node-status query, so those two sources are tried
+# after PTR.  Everything is cached (including failures) for _HOST_CACHE_TTL so
+# repeated sweeps do not re-probe the same host.
+_HOST_CACHE: Dict[str, Tuple[float, str]] = {}
+_HOST_CACHE_TTL = 1800
+
+def _valid_hostname(name: str, ip: str = "") -> bool:
+    """Reject lookup results that are not usable device names."""
+    n = (name or "").strip().strip(".").strip()
+    if not n or len(n) > 253 or len(n) < 2:
+        return False
+    low = n.lower()
+    if low in ("localhost", "localhost.localdomain", "unknown", "n/a", "none",
+               "broadcasthost", "_gateway", "gateway"):
+        return False
+    if ip and n == ip:
+        return False
+    if re.fullmatch(r"[\d.]+", n):        # bare IP address
+        return False
+    return True
+
+def _ptr_name(ip: str) -> str:
+    """Reverse DNS (PTR).  Empty string when the resolver has no answer."""
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return ""
+    return name if _valid_hostname(name, ip) else ""
+
+def _mdns_name(ip: str, timeout: float = 0.8) -> str:
+    """Ask the host itself for its mDNS reverse (PTR) record.
+
+    Sends a unicast-response (QU) PTR query for <reversed-ip>.in-addr.arpa to
+    the mDNS group and accepts only answers that come *from the target IP* and
+    end in .local — so another device's advertisement can never be attributed
+    to this host.
+    """
+    if not SCAPY_OK:
+        return ""
+    try:
+        qname = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+        query = bytes(DNS(id=0, rd=0, qd=DNSQR(qname=qname, qtype="PTR",
+                                              qclass=32769)))
+    except Exception:
+        return ""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        s.settimeout(timeout)
+        s.sendto(query, ("224.0.0.251", 5353))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, addr = s.recvfrom(4096)
+            except (socket.timeout, OSError):
+                break
+            if addr[0] != ip:          # only the target's own answer counts
+                continue
+            try:
+                resp = DNS(data)
+            except Exception:
+                continue
+            for i in range(int(getattr(resp, "ancount", 0) or 0)):
+                try:
+                    rr = resp.an[i]
+                except Exception:
+                    break
+                if getattr(rr, "type", None) != 12:      # PTR
+                    continue
+                raw = rr.rdata
+                name = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                name = (name or "").strip().rstrip(".")
+                if name.lower().endswith(".local") and _valid_hostname(name, ip):
+                    return name
+    except Exception:
+        return ""
+    finally:
+        if s is not None:
+            s.close()
+    return ""
+
+def _nbns_name(ip: str, timeout: float = 0.6) -> str:
+    """NetBIOS node-status (NBSTAT) query — the usual name source on Windows."""
+    if not SCAPY_OK:
+        return ""
+    try:
+        from scapy.layers.netbios import (NBNSNodeStatusRequest,
+                                          NBNSNodeStatusResponse)
+        request = bytes(NBNSNodeStatusRequest(QUESTION_NAME="*"))
+    except Exception:
+        return ""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(request, (ip, 137))
+        data, _ = s.recvfrom(2048)
+    except Exception:
+        return ""
+    finally:
+        if s is not None:
+            s.close()
+    try:
+        resp = NBNSNodeStatusResponse(data)
+    except Exception:
+        return ""
+    # Suffix 0x00 is the workstation service, 0x20 the file-server service.
+    best = ""
+    for entry in getattr(resp, "NODE_NAME", []) or []:
+        try:
+            # scapy's NBNSNodeStatusResponseService exposes the 16-byte name
+            # as NETBIOS_NAME (older code read a non-existent NODE_NAME).
+            raw = getattr(entry, "NETBIOS_NAME", None)
+            if raw is None:
+                raw = getattr(entry, "NODE_NAME", "")
+            name = raw.decode("ascii", "replace") if isinstance(raw, bytes) else str(raw)
+            name = name.strip()
+            suffix = int(getattr(entry, "SUFFIX", -1))
+        except Exception:
+            continue
+        if suffix == 0 and _valid_hostname(name, ip):
+            return name
+        if suffix == 0x20 and _valid_hostname(name, ip) and not best:
+            best = name
+    return best
+
+def resolve_hostname(ip: str) -> str:
+    """Best name this process can get for a host: PTR → mDNS → NetBIOS.
+
+    Returns "" when no source answers; the UI then shows the IP address.  The
+    result is cached for _HOST_CACHE_TTL so a sweep never re-probes the same
+    host every few seconds.
+    """
+    now = time.time()
+    hit = _HOST_CACHE.get(ip)
+    if hit and now - hit[0] < _HOST_CACHE_TTL:
+        return hit[1]
+    name = _ptr_name(ip) or _mdns_name(ip) or _nbns_name(ip)
+    if len(_HOST_CACHE) > 4096:
+        _HOST_CACHE.clear()
+    _HOST_CACHE[ip] = (now, name)
+    return name
+
+
+def add_alert(ip: str, title: str, detail: str, severity: str = "MEDIUM",
+              **meta):
+    """Create an alert.
+
+    `meta` carries the detection-engine fields (rule, attack, action, src, dst,
+    incident, confidence, enrichment, count, last_ts).  They are optional so
+    the scan/vulnerability code paths keep working unchanged.
+    """
     with _lock:
         a = {
-            "id": hashlib.md5(f"{ip}{title}{_ts()}".encode()).hexdigest()[:8],
+            "id": os.urandom(4).hex(),   # unique per alert (md5(ts) collided)
             "ip": ip, "title": title, "detail": detail,
             "severity": severity, "ts": _ts(), "ack": False,
+            "last_ts": _ts(), "count": 1,
         }
+        a.update({k: v for k, v in meta.items() if v is not None})
         alerts.appendleft(a)
         net_stats["alert_count"] += 1
     socketio.emit("new_alert", a)
+    return a
+
+
+# Ports an alert may name.  Only numbers in the known port universe count, so a
+# count or a year in an alert's detail is never mistaken for a port.
+_KNOWN_PORT_UNIVERSE = set(SCAN_PORTS) | set(VULNERABLE_PORTS)
+
+
+def alert_ports_for(ip: str) -> set:
+    """Port numbers that live alerts for `ip` currently name.
+
+    Used to re-verify those ports with a second, independent probe, so a port an
+    alert announced can never quietly drop out of the Ports/Vulnerabilities
+    panels because one scanner's burst missed it.
+    """
+    out: set = set()
+    with _lock:
+        rows = list(alerts)
+    for a in rows:
+        if a.get("ip") != ip or a.get("ack"):
+            continue
+        for n in re.findall(r"(?<![\d.])(\d{1,5})(?![\d.])", a.get("detail") or ""):
+            p = int(n)
+            if p in _KNOWN_PORT_UNIVERSE:
+                out.add(p)
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  VENDOR → OS  (authoritative lookup before any scanning)
@@ -678,7 +1143,7 @@ _ANDROID_VENDORS: Tuple[str, ...] = (
     "tecno", "itel", "gionee", "alcatel", "nokia mobile",
     "motorola", "lenovo mobile", "zte", "lg mobile", "htc",
     "meizu", "nubia", "blackview", "ulefone", "doogee",
-    "oukitel", "umidigi", "cubot", "blu", "wiko", "micromax",
+    "oukitel", "umidigi", "cubot", "blu products", "wiko", "micromax",
     "lava", "karbonn", "symphony", "walton", "pixel", "fairphone",
     "nothing phone", "onyx boox", "sony mobile", "sharp mobile",
 )
@@ -715,7 +1180,9 @@ def infer_os_from_vendor(vendor: str, device_type: str) -> Tuple[str, str]:
         return "iOS / macOS", "Medium (Apple OUI)"
 
     # ── Pure Android brands ────────────────────────────────────────────────────
-    if any(brand in v for brand in _ANDROID_VENDORS):
+    # Whole-word brand match: "vivo" must not match Vivotek, "pixel" must not
+    # match an unrelated company name containing that substring.
+    if any(re.search(r"\b" + re.escape(brand) + r"\b", v) for brand in _ANDROID_VENDORS):
         # Confirm it's a phone/tablet, not a TV (Samsung makes both)
         if any(x in dt for x in ("smart tv", "television", "tv")):
             return "Android TV / Tizen", "High (vendor+type)"
@@ -828,8 +1295,17 @@ def detect_os(ip: str, hostname: str, mac: str,
 # ─────────────────────────────────────────────────────────────────────────────
 class NetworkScanner:
     def __init__(self):
+        # NOTE: python-nmap stores scan results on the PortScanner instance, so
+        # a single shared scanner is NOT thread-safe. Every scan gets its own
+        # instance via _scanner(); this attribute is kept only for readiness
+        # checks ("is the nmap module usable at all").
         self.nm = nmap.PortScanner() if NMAP_OK else None
         self._strategy: Optional[str] = None   # cached working strategy
+
+    @staticmethod
+    def _scanner():
+        """Fresh, per-call PortScanner (see note above)."""
+        return nmap.PortScanner() if NMAP_OK else None
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
@@ -868,18 +1344,20 @@ class NetworkScanner:
         return [{"ip": r.psrc, "mac": r.hwsrc.upper()} for _, r in ans]
 
     def _nmap_arp(self, network: str) -> List[dict]:
-        if not self.nm:
+        nm = self._scanner()
+        if not nm:
             return []
-        self.nm.scan(hosts=network, arguments="-sn -PR --host-timeout 3s -T5")
-        return [{"ip": h, "mac": self.nm[h]["addresses"].get("mac","N/A")}
-                for h in self.nm.all_hosts()]
+        nm.scan(hosts=network, arguments="-sn -PR -n --host-timeout 3s -T5 --min-parallelism 32")
+        return [{"ip": h, "mac": nm[h]["addresses"].get("mac","N/A")}
+                for h in nm.all_hosts()]
 
     def _nmap_ping(self, network: str) -> List[dict]:
-        if not self.nm:
+        nm = self._scanner()
+        if not nm:
             return []
-        self.nm.scan(hosts=network, arguments="-sn -PE -PS22,80,443,8080 --host-timeout 3s -T5")
-        return [{"ip": h, "mac": self.nm[h]["addresses"].get("mac","N/A")}
-                for h in self.nm.all_hosts()]
+        nm.scan(hosts=network, arguments="-sn -PE -PS22,80,443,8080 -n --host-timeout 3s -T5 --min-parallelism 32")
+        return [{"ip": h, "mac": nm[h]["addresses"].get("mac","N/A")}
+                for h in nm.all_hosts()]
 
     def _arp_table(self, network: str) -> List[dict]:
         found: Dict[str, dict] = {}
@@ -907,49 +1385,184 @@ class NetworkScanner:
             except Exception:
                 pass
 
-        # Cross-platform arp -a (only if /proc/net/arp didn't exist or found nothing)
-        try:
-            out = subprocess.check_output(
-                ["arp", "-a"], stderr=subprocess.DEVNULL, timeout=8
-            ).decode(errors="ignore")
-            for line in out.splitlines():
-                # Linux/BSD: "? (192.168.1.10) at aa:bb:cc:dd:ee:ff [ether] on eth0"
-                m = re.search(
-                    r"\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+([0-9a-fA-F:]{17})", line)
-                if not m:
-                    # Windows: " 192.168.1.10        aa-bb-cc-dd-ee-ff     dynamic"
-                    m = re.match(
-                        r"\s*(\d{1,3}(?:\.\d{1,3}){3})\s+"
-                        r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", line)
-                if m:
-                    ip_s = m.group(1)
-                    mac  = m.group(2).replace("-", ":").upper()
-                    # Skip incomplete entries (00:…:00 / ff:ff:ff:ff:ff:ff)
-                    if mac in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
-                        continue
-                    if _in_net(ip_s):
-                        found[ip_s] = {"ip": ip_s, "mac": mac}
-        except Exception:
-            pass
+        # Cross-platform `arp -a` – only when /proc/net/arp is unavailable or
+        # returned nothing. Never fork a subprocess on every 3 s poll.
+        if not found:
+            try:
+                out = subprocess.check_output(
+                    ["arp", "-a"], stderr=subprocess.DEVNULL, timeout=8
+                ).decode(errors="ignore")
+                for line in out.splitlines():
+                    # Linux/BSD: "? (192.168.1.10) at aa:bb:cc:dd:ee:ff [ether] on eth0"
+                    m = re.search(
+                        r"\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+([0-9a-fA-F:]{17})", line)
+                    if not m:
+                        # Windows: " 192.168.1.10        aa-bb-cc-dd-ee-ff     dynamic"
+                        m = re.match(
+                            r"\s*(\d{1,3}(?:\.\d{1,3}){3})\s+"
+                            r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", line)
+                    if m:
+                        ip_s = m.group(1)
+                        mac  = m.group(2).replace("-", ":").upper()
+                        # Skip incomplete entries (00:…:00 / ff:ff:ff:ff:ff:ff)
+                        if mac in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+                            continue
+                        if _in_net(ip_s):
+                            found[ip_s] = {"ip": ip_s, "mac": mac}
+            except Exception:
+                pass
 
         return list(found.values())
 
     # ── Port scan ─────────────────────────────────────────────────────────────
 
+    # ── RustScan discovery ────────────────────────────────────────────────────
+
+    def rustscan(self, ip: str, ports=None, port_range: str = "") -> Optional[set]:
+        """Open TCP ports rustscan actually reported, or None if it did not run.
+
+        None means "the scan did not happen" (binary missing, timeout, non-zero
+        exit) so the caller can fall back to nmap.  An empty set means rustscan
+        ran and saw nothing open, which is a real result.
+        """
+        if not RUSTSCAN_OK:
+            return None
+        cmd = [RUSTSCAN_BIN, "-n", "--no-banner", "-g", "-a", ip,
+               "-b", RUSTSCAN_BATCH, "-t", RUSTSCAN_TIMEOUT,
+               "--tries", RUSTSCAN_TRIES]
+        if port_range:
+            cmd += ["-r", port_range]
+        else:
+            cmd += ["-p", ",".join(str(p) for p in (ports or SCAN_PORTS))]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=RUSTSCAN_DEADLINE)
+        except Exception as exc:
+            _rustscan_failed(str(exc))
+            return None
+        if proc.returncode != 0:
+            _rustscan_failed((proc.stderr or proc.stdout or "").strip()[-200:])
+            return None
+        found: set = set()
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            # greppable: "192.168.2.1 -> [22,53,80]"
+            m = re.search(r"\[([0-9,\s]*)\]\s*$", line)
+            if m:
+                found |= {int(n) for n in re.findall(r"\d+", m.group(1))}
+                continue
+            # plain: "Open 192.168.2.1:22"
+            m = re.search(r":(\d{1,5})\s*$", line)
+            if m and ("Open" in line or "open" in line):
+                found.add(int(m.group(1)))
+        return {p for p in found if 0 < p < 65536}
+
+    def _nmap_services(self, ip: str, ports: List[int]) -> Optional[dict]:
+        """nmap probe of exactly `ports` for service names / versions."""
+        nm = self._scanner()
+        if not nm or not ports:
+            return None
+        timing = ("-n -Pn -T5 --max-retries 2 --min-parallelism 16 "
+                  "--initial-rtt-timeout 250ms --max-rtt-timeout 1s "
+                  "--host-timeout 30s")
+        args  = (f"-sV --version-light {timing}" if IS_ROOT else f"-sT {timing}")
+        try:
+            nm.scan(ip, ",".join(str(p) for p in sorted(ports)), arguments=args)
+            if ip not in nm.all_hosts():
+                return None
+            out: dict = {}
+            for proto in nm[ip].all_protocols():
+                for port, info in nm[ip][proto].items():
+                    if info.get("state") != "open":
+                        continue
+                    out[int(port)] = {
+                        "state":    "open",
+                        "service":  info.get("name", ""),
+                        "version":  f"{info.get('product','')} {info.get('version','')}".strip(),
+                        "protocol": proto,
+                    }
+            return out
+        except Exception:
+            return None
+
     def port_scan(self, ip: str) -> dict:
         """Returns {port: {state, service, version, protocol}}"""
-        if not self.nm:
+        # ── 1. Discovery ──────────────────────────────────────────────────────
+        # rustscan finds the open ports (fast); it always probes SCAN_PORTS so
+        # every port an alert or finding can name is covered, and optionally a
+        # wider range.  nmap then names the services on what was found.
+        found: set = set()
+        used_rustscan = False
+        if RUSTSCAN_OK:
+            base = self.rustscan(ip, ports=SCAN_PORTS)
+            if base is not None:
+                used_rustscan = True
+                found |= base
+                if RUSTSCAN_RANGE:
+                    extra = self.rustscan(ip, port_range=RUSTSCAN_RANGE)
+                    if extra:
+                        found |= extra
+        if used_rustscan:
+            svc = self._nmap_services(ip, sorted(found)) or {}
+            # Union: a port rustscan saw open stays open even if nmap's single
+            # pass on that port disagreed; nmap can also surface a port a busy
+            # rustscan burst dropped.
+            result: dict = dict(svc)
+            for port in found:
+                result.setdefault(port, {
+                    "state": "open", "service": "", "version": "", "protocol": "tcp"})
+            # ── Verify alert / previously-open ports ─────────────────────────
+            # A fast burst can drop a SYN, and a dropped SYN would remove a real
+            # port from the panels while its alert stays.  Re-probe exactly the
+            # ports an alert names or this device had open with nmap, and keep
+            # whatever that independent pass confirms.
+            must = set(alert_ports_for(ip))
+            with _lock:
+                must |= {int(p) for p in ((devices.get(ip) or {}).get("open_ports") or {})
+                         if str(p).isdigit()}
+            missing = sorted(must - set(result))
+            if missing:
+                again = self._nmap_services(ip, missing) or {}
+                for port, info in again.items():
+                    result.setdefault(port, info)
+                if again:
+                    print(f"[Netron] verified {ip} port(s) a burst scan missed: "
+                          f"{', '.join(str(p) for p in sorted(again))}")
+            return result
+
+        # ── 2. nmap-only path (rustscan absent or failed) ─────────────────────
+        nm = self._scanner()
+        if not nm:
             return self._tcp_fallback(ip)
-        ports = "21-25,53,80,110,135,139,143,161,389,443,445,512-514,548,1433,1521,3306,3389,5432,5555,5900,62078,6379,8080,8443,9200,27017"
-        args  = ("-sV --host-timeout 12s -T5" if IS_ROOT
-                 else "-sT --host-timeout 12s -T5")
+        ports = ",".join(str(p) for p in SCAN_PORTS)
+        # -n                : no per-host reverse DNS (the caller resolves once)
+        # -Pn               : discovery already proved the host is up
+        # --min-parallelism stays modest (16): the sweep runs one nmap per host,
+        # so 16 hosts x 64 simultaneous probes saturated the Wi-Fi link and made
+        # hosts answer nothing at all (false 'all ports closed' results).
+        # --max-retries 2   : a filtered port costs two retransmits, not the
+        #                     default ten
+        # --version-light   : real version detection, fewer probe groups (nmap
+        #                     -sV's default probe set is the biggest cost here)
+        # RTT timeouts stay generous (250 ms initial / 1 s max): shrinking them
+        # further would start reporting slow-but-open ports as filtered on
+        # Wi-Fi, i.e. it would hide findings to win a second.
+        timing = ("-n -Pn -T5 --max-retries 2 --min-parallelism 16 "
+                  "--initial-rtt-timeout 250ms --max-rtt-timeout 1s "
+                  "--host-timeout 12s")
+        args  = (f"-sV --version-light {timing}" if IS_ROOT else f"-sT {timing}")
         try:
-            self.nm.scan(ip, ports, arguments=args)
-            if ip not in self.nm.all_hosts():
+            nm.scan(ip, ports, arguments=args)
+            if ip not in nm.all_hosts():
                 return self._tcp_fallback(ip)
             result = {}
-            for proto in self.nm[ip].all_protocols():
-                for port, info in self.nm[ip][proto].items():
+            for proto in nm[ip].all_protocols():
+                for port, info in nm[ip][proto].items():
+                    # nmap reports every scanned port; only listening ports are
+                    # kept, otherwise the UI would count closed/filtered ports
+                    # as open (and disagree with the Ports panel).
+                    if info.get("state") != "open":
+                        continue
                     result[port] = {
                         "state":    info.get("state", ""),
                         "service":  info.get("name", ""),
@@ -963,39 +1576,9 @@ class NetworkScanner:
     def _tcp_fallback(self, ip: str) -> dict:
         """
         Pure-Python parallel TCP connect scan (no root needed).
-        Covers the most informative ports with a 0.35-second timeout.
-        Uses up to 48 threads so all ports are tried simultaneously.
+        Probes SCAN_PORTS with a 0.35-second connect timeout, all at once.
         """
-        PORTS = [
-            # Common services
-            21, 22, 23, 25, 53, 80, 110, 111, 135, 137, 139, 143, 161,
-            389, 443, 445, 512, 513, 514, 548, 587, 631,
-            # Database
-            1433, 1521, 3306, 5432, 5984, 6379, 7474, 8086, 9200, 27017, 28017,
-            # Remote access
-            3389, 5900, 5901, 5902, 5985, 5986,
-            # Web / proxy
-            80, 81, 82, 83, 84, 85, 86, 87, 88,
-            8000, 8008, 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088,
-            8090, 8443, 8888, 8899, 9000, 9090, 9100, 9443,
-            # IoT / smart home
-            1883, 4840, 5683, 8883,   # MQTT, OPC-UA, CoAP
-            # Apple / Bonjour
-            5353, 62078,
-            # Media / streaming
-            554, 1935, 8554,          # RTSP
-            # Printing
-            515, 9100, 631,
-            # Android ADB
-            5555,
-        ]
-        # Deduplicate while preserving order
-        seen_p: set = set()
-        deduped = []
-        for p in PORTS:
-            if p not in seen_p:
-                seen_p.add(p)
-                deduped.append(p)
+        deduped = SCAN_PORTS
 
         result: dict = {}
         def probe(port: int):
@@ -1008,17 +1591,21 @@ class NetworkScanner:
             except Exception:
                 return port, None
 
-        with ThreadPoolExecutor(max_workers=48) as ex:
-            for port, info in ex.map(probe, deduped):
-                if info:
-                    result[port] = info
+        # Shared, module-level pool: a per-call pool inside the 12-worker scan
+        # pool would allow 12 × 48 = 576 threads at once.
+        for port, info in _TCP_POOL.map(probe, deduped):
+            if info:
+                result[port] = info
         return result
 
     # ── TTL ping ──────────────────────────────────────────────────────────────
 
     def ping_ttl(self, ip: str) -> int:
         windows = platform.system().lower() == "windows"
-        cmd = ["ping", "-n", "1"] if windows else ["ping", "-c", "1", "-W", "1"]
+        # Windows needs -w 1000: the default reply timeout is 4 s, which would
+        # outlive the 2 s subprocess timeout and always yield TTL 0.
+        cmd = (["ping", "-n", "1", "-w", "1000"] if windows
+               else ["ping", "-c", "1", "-W", "1"])
         cmd.append(ip)
         try:
             out = subprocess.check_output(
@@ -1032,12 +1619,13 @@ class NetworkScanner:
     # ── nmap OS (root only) ───────────────────────────────────────────────────
 
     def nmap_os(self, ip: str) -> Tuple[str, str]:
-        if not IS_ROOT or not self.nm:
+        nm = self._scanner()
+        if not IS_ROOT or not nm:
             return "", ""
         try:
-            self.nm.scan(ip, arguments="-O --host-timeout 8s -T5")
-            if ip in self.nm.all_hosts():
-                matches = self.nm[ip].get("osmatch", [])
+            nm.scan(ip, arguments="-O -n --host-timeout 8s -T5 --max-retries 2 --max-os-tries 1")
+            if ip in nm.all_hosts():
+                matches = nm[ip].get("osmatch", [])
                 if matches:
                     m = matches[0]
                     return m.get("name",""), f"{m.get('accuracy','')}%"
@@ -1048,20 +1636,31 @@ class NetworkScanner:
     # ── Vulnerability assessment ──────────────────────────────────────────────
 
     def assess_vulns(self, open_ports: dict) -> List[dict]:
-        seen, vulns = set(), []
+        seen, vulns, open_nums = set(), [], set()
         for port, info in open_ports.items():
-            if info.get("state") != "open":
+            if not isinstance(info, dict) or info.get("state") != "open":
                 continue
+            # Port keys are ints from nmap and the TCP fallback, but a JSON
+            # round-trip turns them into strings. Coerce so a finding can
+            # never silently disappear because of the key type.
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                continue
+            open_nums.add(port)
             if port in VULNERABLE_PORTS and port not in seen:
                 seen.add(port)
                 name, sev, desc = VULNERABLE_PORTS[port]
-                vulns.append({"port":port,"service":name,"severity":sev,
+                # Prefer the service name the scan actually saw ("domain"), so
+                # the finding, the Ports panel and the alert use one label.
+                label = service_label(port, info.get("service", "")) or name
+                vulns.append({"port":port,"service":label,"severity":sev,
                                "description":desc,"version":info.get("version","")})
         # NoSQL trifecta check
-        exposed = [p for p in (6379,27017,9200) if open_ports.get(p,{}).get("state")=="open"]
+        exposed = [p for p in (6379,27017,9200) if p in open_nums]
         if exposed:
             vulns.append({"port":0,"service":"Unauthenticated DB","severity":"CRITICAL",
-                          "description":f"Exposed NoSQL ports: {exposed} – likely no auth required",
+                          "description":f"NoSQL ports reachable on this host: {exposed} – Netron does not verify whether authentication is enforced",
                           "version":""})
         return vulns
 
@@ -1105,6 +1704,1524 @@ def _app_proto(sport, dport, transp) -> str:
             return hit
     return ""
 
+# ═════════════════════════════════════════════════════════════════════──────
+#  VoIP PROTOCOL CLASSIFICATION
+# ═════════════════════════════════════════════════════════════════════──────
+# Ports assigned to a VoIP protocol by its own standard / IANA.  A label taken
+# from this table is a fact about the port, not a guess about the contents.
+VOIP_PORTS: Dict[Tuple[int, str], str] = {
+    (5060, "udp"): "SIP",      (5060, "tcp"): "SIP",
+    (5061, "udp"): "SIP/TLS",  (5061, "tcp"): "SIP/TLS",
+    (1719, "udp"): "H.323 RAS", (1720, "tcp"): "H.323",
+    (2427, "udp"): "MGCP",     (2727, "udp"): "MGCP",
+    (2000, "udp"): "SCCP",     (2000, "tcp"): "SCCP",
+    (4569, "udp"): "IAX2",
+    (3478, "udp"): "STUN",     (3478, "tcp"): "STUN",
+}
+
+# First token of a SIP request, or the status line of a SIP response.
+_SIP_TOKENS: Tuple[bytes, ...] = (
+    b"INVITE", b"ACK", b"BYE", b"CANCEL", b"OPTIONS", b"REGISTER",
+    b"PRACK", b"SUBSCRIBE", b"NOTIFY", b"PUBLISH", b"INFO", b"REFER",
+    b"MESSAGE", b"UPDATE", b"SIP/2.0",
+)
+
+# UDP ports that carry a different protocol; a frame on one of these is never
+# relabelled RTP/RTCP even if its first byte happens to look like a header.
+_NOT_RTP_PORTS = frozenset({
+    53, 67, 68, 69, 123, 137, 138, 161, 162, 500, 514, 520, 1900, 3478,
+    3702, 4500, 5353, 5355, 5060, 5061,
+})
+
+
+def voip_label(sport, dport, transp, payload: bytes = b"") -> str:
+    """VoIP protocol for one packet, or "" when it is not VoIP traffic.
+
+    Two independent kinds of evidence are accepted:
+
+    * **Port evidence** – the port belongs to a VoIP protocol (works in psutil
+      socket-table mode too, where no payload is available).
+    * **Payload evidence** – a real SIP request/status line, or a well-formed
+      RTP/RTCP header (version 2, a registered payload type, consistent length).
+
+    RTP and RTCP use dynamic ports, so they are only ever reported from a header
+    check on captured bytes -- never from a port range alone.
+    """
+    s = int(sport or 0)
+    d = int(dport or 0)
+    t = (transp or "").lower()
+    for p in (d, s):
+        hit = VOIP_PORTS.get((p, t))
+        if hit:
+            return hit
+    if not payload:
+        return ""
+    head = payload[:16].lstrip()
+    for tok in _SIP_TOKENS:
+        if head.startswith(tok):
+            return "SIP"
+    if t != "udp" or len(payload) < 8:
+        return ""
+    if (payload[0] >> 6) != 2:          # RTP/RTCP version field must be 2
+        return ""
+    if s <= 1024 and d <= 1024:
+        return ""
+    if s in _NOT_RTP_PORTS or d in _NOT_RTP_PORTS:
+        return ""
+    pt = payload[1]
+    if 192 <= pt <= 223:                # RTCP packet type range
+        declared = (int.from_bytes(payload[2:4], "big") + 1) * 4
+        if 8 <= declared <= len(payload):
+            return "RTCP"
+        return ""
+    payload_type = pt & 0x7F
+    # Registered RTP payload types: 0-34 static, 96-127 dynamic.  35-95 are
+    # unassigned, so such a frame is not confidently RTP and is left unlabelled.
+    if payload_type <= 34 or 96 <= payload_type <= 127:
+        return "RTP"
+    return ""
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DETECTION ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+#  Design rules this module follows:
+#
+#   * A rule is only emitted from telemetry Netron actually observes.  Every
+#     rule declares its data source (`requires`); /api/detections reports the
+#     live status of each source, so "no alert" never silently means "no
+#     detection capability".
+#   * Per-host baselines (bytes/minute) and per-role thresholds instead of one
+#     global fixed threshold.  Servers, workstations and IoT devices are
+#     classified and treated differently.
+#   * Alerts are enriched (hostname, vendor, role, criticality, VLAN, TI) and
+#     scored, then correlated per source into incidents: a scan followed by
+#     auth failures and a login is one incident, not three unrelated alerts.
+#   * Dedupe + rate-limit: repeated hits inside a cooldown update the existing
+#     alert's count instead of creating a new one, and each rule has an hourly
+#     emission cap so one noisy host cannot flood the list.
+#   * Every alert carries an ATT&CK technique id and a response action.
+#
+#  Not implemented (and therefore never reported as active): detections that
+#  need decrypted auth protocols or Windows Domain Controller audit logs --
+#  SSH/RDP/SMB/LDAP/Kerberos/VPN failed-login events can only come from host or
+#  DC logs; Netron reads Linux auth logs when available and says so.
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+DET_SCAN_WINDOW    = 60      # seconds
+DET_SCAN_HOSTS     = _env_int("NETRON_SCAN_HOSTS", 10)
+DET_SCAN_PORTS     = _env_int("NETRON_SCAN_PORTS", 15)
+DET_SCAN_BREADTH   = 3       # max ports per host for a horizontal scan
+DET_RST_WINDOW     = 30
+DET_RST_BURST      = 30
+DET_ICMP_WINDOW    = 30
+DET_ICMP_BURST     = 20
+DET_ICMP_BIG       = 1200    # payload bytes before an ICMP packet looks tunnelled
+DET_ARP_WINDOW     = 10
+DET_ARP_FLOOD      = 20
+DET_DNS_WINDOW     = 60
+DET_DNS_ENT_MINLEN = 30      # label length that starts looking like encoding
+DET_DNS_ENT_BITS   = 3.3    # hex-encoded labels sit around 3.5-3.9 bits/char
+DET_DNS_ENT_COUNT  = 3
+DET_DNS_TXT_COUNT  = 20
+DET_DNS_NX_COUNT   = 25
+DET_DNS_BIG_UDP    = 1000    # bytes (512 + EDNS/DNSSEC stays below this)
+DET_SMB_OPS        = 200
+DET_SMB_SESSIONS   = 10
+DET_KRB_TGS        = 20
+DET_AUTH_WINDOW    = 300
+DET_AUTH_FAILS     = 8
+DET_AUTH_USERS     = 5
+DET_AUTH_SRCS      = 5
+DET_BW_MIN_BYTES   = 5 * 1024 * 1024
+DET_BW_FACTOR      = 4.0
+DET_BW_WINDOW      = 60
+DET_BEACON_MIN     = 6
+DET_BEACON_IV_CV   = 0.10
+DET_BEACON_SIZE_CV = 0.15
+DET_LONG_FLOW_SECS = 1800
+BUSINESS_START     = _env_int("NETRON_BUSINESS_START", 7)
+BUSINESS_END       = _env_int("NETRON_BUSINESS_END", 19)
+
+# Known DoH resolver hostnames.  "Sanctioned" resolvers are configured with
+# NETRON_APPROVED_DOH (comma separated suffixes; empty = none sanctioned).
+DOH_HOSTS = frozenset({
+    "cloudflare-dns.com", "mozilla.cloudflare-dns.com", "dns.google",
+    "dns.quad9.net", "doh.opendns.com", "dns.adguard-dns.com",
+    "dns.nextdns.io", "doh.cleanbrowsing.org", "dns.mullvad.net",
+    "doh.libredns.gr", "doh.dns.sb", "dns.google.com",
+})
+# Commercial remote-management / tunnelling service domains.  Approved ones are
+# set with NETRON_APPROVED_RMM.
+RMM_HOSTS = frozenset({
+    "anydesk.com", "teamviewer.com", "screenconnect.com", "logmein.com",
+    "splashtop.com", "gotomypc.com", "rustdesk.com", "ngrok.io",
+    "ngrok-free.app", "zohoassist.com", "remoteutilities.com", "supremo.com",
+    "dwservice.net", "iperiusremote.com",
+})
+MINING_HOSTS = frozenset({
+    "pool.minexmr.com", "xmrpool.eu", "nanopool.org", "2miners.com",
+    "ethermine.org", "flexpool.io", "miningpoolhub.com", "braiins.com",
+    "antpool.com", "f2pool.com", "poolin.com", "viabtc.com",
+    "hashvault.pro", "moneroocean.stream", "supportxmr.com",
+})
+CLOUD_UPLOAD_HOSTS = frozenset({
+    "dropbox.com", "drive.google.com", "onedrive.live.com", "sharepoint.com",
+    "box.com", "mega.nz", "mediafire.com", "pastebin.com", "hastebin.com",
+    "transfer.sh", "file.io", "wetransfer.com", "gofile.io", "0x0.st",
+    "catbox.moe", "litterbox.catbox.moe", "paste.ee", "clbin.com",
+})
+HTTP_PORTS = frozenset({80, 8080, 8000, 8008, 8081, 8082, 8083, 8084, 8085,
+                        8086, 8087, 8088, 8090, 8888, 9000, 9090, 3128, 443})
+ADMIN_PORTS = {3389: "RDP", 445: "SMB", 23: "Telnet", 5900: "VNC",
+               5985: "WinRM", 5986: "WinRM-TLS", 22: "SSH"}
+DB_PORTS = frozenset({1433, 1521, 3306, 5432, 6379, 9200, 27017, 5984, 8086})
+DC_PORTS = frozenset({88, 389, 636, 3268, 3269})
+MAIL_PORTS = frozenset({25, 587, 465, 110, 143, 993, 995})
+IOT_TYPES = frozenset({"IoT / SBC", "Smart Device", "IP Camera", "Smart TV",
+                       "Printer", "Smart Speaker", "Smart Home"})
+DNS_QTYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 10: "NULL", 12: "PTR",
+              15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS", 255: "ANY"}
+
+SEV_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+def _sev_up(sev: str, steps: int = 1) -> str:
+    try:
+        i = SEV_ORDER.index(sev)
+    except ValueError:
+        return sev
+    return SEV_ORDER[min(len(SEV_ORDER) - 1, i + steps)]
+
+def _domain_match(name: str, suffixes) -> str:
+    n = (name or "").strip().lower().rstrip(".")
+    if not n:
+        return ""
+    for s in suffixes:
+        if n == s or n.endswith("." + s):
+            return s
+    return ""
+
+def _dns_base(qname: str) -> str:
+    labels = [l for l in (qname or "").rstrip(".").split(".") if l]
+    return ".".join(labels[-2:]) if len(labels) >= 2 else (qname or "")
+
+def _entropy_bits(s: str) -> float:
+    if not s:
+        return 0.0
+    counts: Dict[str, int] = defaultdict(int)
+    for ch in s:
+        counts[ch] += 1
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+def _is_public_ip(ip: str) -> bool:
+    """True only for globally routable unicast addresses."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (a.is_private or a.is_loopback or a.is_link_local or
+                a.is_multicast or a.is_reserved or a.is_unspecified)
+
+def _is_random_mac(mac: str) -> bool:
+    """Locally-administered bit set -> randomised (phone privacy) MAC."""
+    try:
+        return bool(int(str(mac).replace("-", ":").split(":")[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+# ── Asset inventory (new-MAC detection + optional owner/criticality) ──────────
+_STATE_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+INVENTORY_PATH = os.environ.get("NETRON_INVENTORY", os.path.join(_STATE_DIR, "netron-inventory.json"))
+_inv_lock      = threading.Lock()
+_inv: Dict[str, dict] = {}
+_inv_loaded    = False
+_inv_last_save = 0.0
+
+def inventory_load() -> None:
+    global _inv_loaded
+    with _inv_lock:
+        if _inv_loaded:
+            return
+        _inv_loaded = True
+        try:
+            with open(INVENTORY_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data.get("macs"), dict):
+                _inv.update({str(k).upper(): v for k, v in data["macs"].items()
+                             if isinstance(v, dict)})
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+
+def inventory_save(force: bool = False) -> None:
+    global _inv_last_save
+    with _inv_lock:
+        now = time.time()
+        if not force and now - _inv_last_save < 30:
+            return
+        _inv_last_save = now
+        try:
+            os.makedirs(os.path.dirname(INVENTORY_PATH), exist_ok=True)
+            tmp = INVENTORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "macs": _inv}, fh, indent=1, sort_keys=True)
+            os.replace(tmp, INVENTORY_PATH)
+        except OSError as e:
+            log.warning("[Netron] inventory save failed: %s", e)
+
+def inventory_get(mac: str) -> dict:
+    inventory_load()
+    with _inv_lock:
+        return dict(_inv.get(str(mac).upper(), {}))
+
+def inventory_mark(mac: str, ip: str, vendor: str = "") -> bool:
+    """Record a MAC in the inventory.  Returns True if it was newly added."""
+    inventory_load()
+    mac = str(mac).upper()
+    if len(mac) < 11 or mac in ("N/A", ""):
+        return False
+    with _inv_lock:
+        ent = _inv.get(mac)
+        new  = ent is None
+        if ent is None:
+            ent = {"first_seen": _ts(), "randomized": _is_random_mac(mac)}
+            if vendor:
+                ent["vendor"] = vendor
+            _inv[mac] = ent
+        ent["last_ip"]   = ip
+        ent["last_seen"] = _ts()
+    if not new:
+        inventory_save()
+    else:
+        inventory_save(force=True)
+    return new
+
+# ── Rule catalog ──────────────────────────────────────────────────────────────
+# requires: capture (network-wide packet capture), authlog (readable Linux
+# auth log), inventory (local asset DB), dnsfeed (optional internet feed).
+def _R(title, family, requires, severity, attack, action, cooldown=600, rate=6):
+    return {"title": title, "family": family, "requires": requires,
+            "severity": severity, "attack": attack, "action": action,
+            "cooldown": cooldown, "rate": rate}
+
+RULES: Dict[str, dict] = {
+    # ── Reconnaissance ────────────────────────────────────────────────────────
+    "PORT_SCAN_HORIZONTAL": _R("Horizontal port scan", "recon", "capture", "HIGH",
+        "T1046 Network Service Discovery", "Investigate source host; block at perimeter", 600),
+    "PORT_SCAN_VERTICAL": _R("Vertical port scan", "recon", "capture", "HIGH",
+        "T1046 Network Service Discovery", "Investigate source host; rate-limit on switch", 600),
+    "IOT_TELNET_SCAN": _R("IoT device scanning Telnet", "recon", "capture", "CRITICAL",
+        "T1595.001 Active Scanning: IP Blocks", "Isolate the IoT device; it is likely infected", 900),
+    "RST_BURST": _R("RST reply burst", "recon", "capture", "MEDIUM",
+        "T1046 Network Service Discovery", "Identify the host probing closed ports", 900),
+    "ICMP_UNREACH_BURST": _R("ICMP unreachable burst", "recon", "capture", "MEDIUM",
+        "T1046 Network Service Discovery", "Identify the host sweeping the network", 900),
+    "ICMP_LARGE_PAYLOAD": _R("Oversized ICMP payload", "c2", "capture", "MEDIUM",
+        "T1095 Non-Application Layer Protocol", "Inspect the ICMP payload for tunnelling", 900),
+    # ── Layer 2 poisoning ─────────────────────────────────────────────────────
+    "ARP_IP_CONFLICT": _R("One IP claimed by multiple MACs", "l2", "capture", "CRITICAL",
+        "T1557.002 ARP Cache Poisoning", "Investigate both hosts; clear ARP caches", 300),
+    "ARP_GATEWAY_CHANGE": _R("Gateway MAC address changed", "l2", "capture", "CRITICAL",
+        "T1557.002 ARP Cache Poisoning", "Verify gateway; contain the spoofing host", 300),
+    "ARP_GRATUITOUS_FLOOD": _R("Gratuitous ARP flood", "l2", "capture", "HIGH",
+        "T1557.002 ARP Cache Poisoning", "Contain source; check for ARP spoofing tooling", 300),
+    "DHCP_ROGUE_SERVER": _R("Rogue DHCP server", "l2", "capture", "CRITICAL",
+        "T1557.003 DHCP Spoofing", "Block the rogue server; renew leases", 600),
+    "DHCP_FINGERPRINT_CHANGE": _R("DHCP fingerprint changed for host", "l2", "capture", "MEDIUM",
+        "T1557.003 DHCP Spoofing", "Verify the device identity (possible spoofed host)", 1800),
+    "VLAN_RESTRICTED": _R("Device on restricted VLAN", "l2", "capture", "HIGH",
+        "T1599 Network Boundary Bridging", "Verify VLAN assignment on the access port", 1800),
+    # ── Name resolution ───────────────────────────────────────────────────────
+    "LLMNR_RESPONSE": _R("LLMNR/NBT-NS response from unexpected host", "dns", "capture", "HIGH",
+        "T1557.001 LLMNR/NBT-NS Poisoning", "Disable LLMNR/NBT-NS or contain the responder", 900),
+    "HONEYPOT_QUERY": _R("Honeypot name queried", "dns", "capture", "MEDIUM",
+        "T1071 Application Layer Protocol", "Identify the host resolving decoy names", 600),
+    "HONEYPOT_ANSWERED": _R("Honeypot name answered by unauthorised responder", "dns", "capture", "CRITICAL",
+        "T1557.001 LLMNR/NBT-NS Poisoning", "Contain responder; it is impersonating the resolver", 600),
+    "DNS_ENTROPY": _R("High-entropy DNS subdomains", "dns", "capture", "HIGH",
+        "T1071.004 DNS", "Check host for DNS tunnelling or DGA malware", 900),
+    "DNS_TXT_VOLUME": _R("High TXT/NULL query volume per domain", "dns", "capture", "MEDIUM",
+        "T1071.004 DNS", "Inspect DNS payloads for tunnelled data", 900),
+    "DNS_NXDOMAIN_BURST": _R("NXDOMAIN burst", "dns", "capture", "MEDIUM",
+        "T1008 Fallback Channels", "Check host for DGA activity or resolver issues", 900),
+    "DNS_LARGE_PAYLOAD": _R("Oversized DNS payload", "dns", "capture", "MEDIUM",
+        "T1071.004 DNS", "Inspect DNS payload for tunnelling", 900),
+    "NEW_DOMAIN": _R("Newly registered domain resolved", "dns", "dnsfeed", "MEDIUM",
+        "T1583.001 Acquire Infrastructure: Domains", "Treat destination as untrusted; verify business need", 3600),
+    # ── SMB / Windows ────────────────────────────────────────────────────────
+    "SMB_ADMIN_SHARE": _R("Administrative share accessed (C$/ADMIN$)", "lateral", "capture", "HIGH",
+        "T1021.002 SMB/Windows Admin Shares", "Investigate the source account and host", 600),
+    "SMB_MASS_FILE_OPS": _R("Mass SMB file operations", "lateral", "capture", "HIGH",
+        "T1021.002 SMB/Windows Admin Shares", "Check for ransomware staging or bulk exfil", 600),
+    "SMB_SESSION_SPIKE": _R("SMB session spike", "lateral", "capture", "MEDIUM",
+        "T1021.002 SMB/Windows Admin Shares", "Identify the host opening many SMB sessions", 600),
+    "SMB_SIGNING_DISABLED": _R("SMB signing not enabled on target", "lateral", "capture", "MEDIUM",
+        "T1557 Adversary-in-the-Middle", "Enable SMB signing on the target", 3600),
+    "DCERPC_DRSUAPI": _R("DRSUAPI replication call from non-DC", "cred", "capture", "CRITICAL",
+        "T1003.006 DCSync", "Contain source host; rotate krbtgt if confirmed", 300),
+    "KRB_RC4": _R("Kerberos RC4 (etype 23) ticket", "cred", "capture", "MEDIUM",
+        "T1558 Steal or Forge Kerberos Tickets", "Disable RC4 for the account/domain", 1800),
+    "KRB_TGS_BURST": _R("Kerberos TGS request burst", "cred", "capture", "HIGH",
+        "T1558.003 Kerberoasting", "Review requested SPNs and the source account", 600),
+    # ── Web / C2 / policy ────────────────────────────────────────────────────
+    "WEB_ODD_PORT": _R("HTTP on non-standard port", "policy", "capture", "LOW",
+        "T1571 Non-Standard Port", "Confirm the service is sanctioned", 1800),
+    "MINING_STRATUM": _R("Cryptomining traffic", "c2", "capture", "HIGH",
+        "T1496 Resource Hijacking", "Block pool destination; clean the host", 900),
+    "TOR_EXIT": _R("Connection to Tor exit node", "c2", "capture", "HIGH",
+        "T1090.003 Multi-hop Proxy", "Block destination; investigate the host", 900),
+    "RMM_REMOTE_ACCESS": _R("Remote-management tool traffic", "c2", "capture", "MEDIUM",
+        "T1219 Remote Access Software", "Confirm the tool is approved for this host", 1800),
+    "DOH_UNSANCTIONED": _R("DNS-over-HTTPS to unsanctioned resolver", "c2", "capture", "MEDIUM",
+        "T1572 Protocol Tunneling", "Enforce approved resolvers at the firewall", 1800),
+    "CLOUD_UPLOAD": _R("Large upload to cloud storage/paste site", "exfil", "capture", "HIGH",
+        "T1567.002 Exfiltration to Cloud Storage", "Verify the transfer with the user", 900),
+    "SMTP_OUTBOUND": _R("Outbound SMTP from non-mail host", "exfil", "capture", "MEDIUM",
+        "T1048 Exfiltration Over Alternative Protocol", "Block direct SMTP; require the relay", 1800),
+    "LATERAL_W2W": _R("Workstation-to-workstation admin protocol", "lateral", "capture", "MEDIUM",
+        "T1021 Remote Services", "Confirm the admin action; most estates baseline this at zero", 600),
+    "INBOUND_EXTERNAL_ADMIN": _R("Inbound admin-port connection from outside", "exposure", "capture", "HIGH",
+        "T1133 External Remote Services", "Block at the perimeter; verify port-forwarding", 600),
+    # ── Behavioural / baseline ───────────────────────────────────────────────
+    "BW_OUTLIER": _R("Outbound volume above host baseline", "exfil", "capture", "HIGH",
+        "T1030 Data Transfer Size Limits", "Verify the transfer; check destination reputation", 900),
+    "BW_OFF_HOURS": _R("Off-hours large transfer", "exfil", "capture", "HIGH",
+        "T1029 Scheduled Transfer", "Verify with the asset owner", 900),
+    "FLOW_BEACON": _R("Periodic beaconing", "c2", "capture", "HIGH",
+        "T1071 Application Layer Protocol", "Capture full packets for the destination", 1800),
+    "FLOW_LONG_LOW_VOLUME": _R("Long-lived low-volume session", "c2", "capture", "MEDIUM",
+        "T1071 Application Layer Protocol", "Inspect the session payload", 1800),
+    "SYN_FLOOD": _R("SYN flood", "dos", "capture", "HIGH",
+        "T1498 Network Denial of Service", "Rate-limit source; check target health", 300),
+    # ── Authentication (host auth log) ───────────────────────────────────────
+    "AUTH_BRUTE_FORCE": _R("Authentication brute force", "auth", "authlog", "HIGH",
+        "T1110.001 Password Guessing", "Block source; lock targeted accounts", 600),
+    "AUTH_PASSWORD_SPRAY": _R("Password spray (one source, many accounts)", "auth", "authlog", "HIGH",
+        "T1110.003 Password Spraying", "Block source; reset affected accounts", 600),
+    "AUTH_DISTRIBUTED": _R("One account tried from many sources", "auth", "authlog", "HIGH",
+        "T1110.004 Credential Stuffing", "Lock the account; block the sources", 600),
+    "AUTH_SUCCESS_AFTER_FAIL": _R("Successful login after failures", "auth", "authlog", "CRITICAL",
+        "T1078 Valid Accounts", "Verify with the user; consider session revocation", 300),
+    # ── Asset inventory ─────────────────────────────────────────────────────
+    "NEW_MAC": _R("New MAC address on the network", "inventory", "inventory", "LOW",
+        "T1200 Hardware Additions", "Confirm the device belongs to the estate", 3600),
+    "NEW_DEVICE_PORT": _R("New admin service exposed by device", "exposure", "scan", "MEDIUM",
+        "T1133 External Remote Services", "Confirm the service is required and patched", 3600),
+}
+
+class DetectionEngine:
+    """Stateful detection over the telemetry Netron actually observes.
+
+    Thread-safety: `_lk` guards engine state and is never held while taking
+    `_lock` (the device/alerts lock) because device registration calls into
+    the engine.  Emitting takes `_em_lk` for dedupe/rate-limit bookkeeping only.
+    """
+
+    def __init__(self):
+        self._lk     = threading.RLock()
+        self._em_lk  = threading.Lock()
+        self.started = time.time()
+        self.gateway = ""
+        self._net: Optional[ipaddress.IPv4Network] = None
+        try:
+            self.gateway, _netstr = get_local_network()
+            self._net = ipaddress.ip_network(_netstr, strict=False)
+        except Exception:
+            pass
+        # Per-rule observation buffers (all bounded)
+        self._syn       = {}   # src → deque[(ts, dst, dport)]
+        self._syn_all   = {}   # src → deque[ts]  (any SYN, for flood detection)
+        self._rst       = {}   # src → deque[(ts, dst)]
+        self._rst_rx    = {}   # dst → deque[(ts, src)]
+        self._icmp      = {}   # src → deque[ts]
+        self._icmp_big  = {}   # src → deque[ts] of oversized ICMP
+        self._arp_ip    = {}   # ip → {mac: last_ts}
+        self._gw_mac    = None
+        self._garp      = {}   # src → deque[ts]
+        self._dhcp_fp   = {}   # mac → option signature
+        self._dns       = {}   # src → deque[(ts, base, label, qtype)]
+        self._nx        = {}   # client → deque[ts]
+        self._llmnr     = {}   # responder → deque[ts]
+        self._smb_ops   = {}   # src → deque[ts]
+        self._smb_sess  = {}   # src → deque[ts]
+        self._smb_sign  = {}   # target → (ts, signing_enabled)
+        self._krb_tgs   = {}   # src → deque[ts]
+        self._flows     = {}   # 5-tuple → flow record
+        self._bw        = {}   # ip → byte bucket/baseline
+        self._auth      = {}   # src → deque[(ts, user, ok)]
+        self._auth_user = {}   # user → {src: deque[ts]}
+        self._auth_distr = {}  # user → last distributed-spray alert ts
+        self._ports_seen = {}  # ip → set(open ports)
+        self._host_vlan = {}   # ip → vlan id
+        # Alert bookkeeping
+        self._suppress  = {}   # (rule, src, dst) → {alert, last, count}
+        self._rate      = {}   # rule → deque[ts]
+        self._inc_src   = {}   # src → incident state
+        self._suppressed = 0
+        # Feeds / config
+        self._tor       = set()
+        self._tor_status = "not loaded"
+        self._tor_ts    = 0.0
+        self._tor_enabled = os.environ.get("NETRON_TOR_FEED", "1") != "0"
+        self._ti_nets: List[ipaddress.IPv4Network] = []
+        self._ti_status = "not configured"
+        self._geo_enabled = os.environ.get("NETRON_GEO", "0") == "1"
+        self._geo_cache: Dict[str, str] = {}
+        self._geo_queue: deque = deque(maxlen=200)
+        self._rdap_enabled = os.environ.get("NETRON_RDAP", "0") == "1"
+        self._rdap_cache: Dict[str, Optional[int]] = {}
+        self._rdap_queue: deque = deque(maxlen=200)
+        self._rdap_status = "disabled"
+        self._approved_doh = frozenset(s.strip().lower() for s in
+                                       os.environ.get("NETRON_APPROVED_DOH", "").split(",") if s.strip())
+        self._approved_rmm = frozenset(s.strip().lower() for s in
+                                       os.environ.get("NETRON_APPROVED_RMM", "").split(",") if s.strip())
+        self._honeypots = frozenset(s.strip().lower() for s in
+                                    os.environ.get("NETRON_HONEYPOT_NAMES", "").split(",") if s.strip())
+        self._llmnr_ok = frozenset(s.strip() for s in
+                                   os.environ.get("NETRON_LLMNR_RESPONDERS", "").split(",") if s.strip())
+        self._dhcp_ok = set(s.strip() for s in
+                            os.environ.get("NETRON_DHCP_SERVERS", "").split(",") if s.strip())
+        try:
+            self._restricted_vlans = {int(v) for v in
+                                      os.environ.get("NETRON_RESTRICTED_VLANS", "").split(",") if v.strip()}
+        except ValueError:
+            self._restricted_vlans = set()
+        self._role_cache: Dict[str, Tuple[float, str]] = {}
+        self._rules_fired: Dict[str, int] = defaultdict(int)
+        self._obs = defaultdict(int)
+        self.capture_seen = False
+        self._packets     = 0
+        self.flow_count   = 0
+        # Inventory warm baseline: only alert on new MACs once we already had one
+        inventory_load()
+        self._inv_preexisting = len(_inv)
+        self._load_ti()
+
+    # ── Config / feeds ───────────────────────────────────────────────────────
+    def _load_ti(self) -> None:
+        path = os.environ.get("NETRON_TI_LIST", "")
+        if not path:
+            return
+        try:
+            nets = []
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    try:
+                        nets.append(ipaddress.ip_network(line, strict=False))
+                    except ValueError:
+                        continue
+            self._ti_nets = nets
+            self._ti_status = f"{len(nets)} entries from {path}"
+        except OSError as e:
+            self._ti_status = f"unreadable: {e}"
+
+    def refresh_feeds(self) -> None:
+        if not self._tor_enabled or not REQUESTS_OK:
+            if not REQUESTS_OK:
+                self._tor_status = "requests not installed"
+            return
+        now = time.time()
+        if now - self._tor_ts < 86400 and self._tor:
+            return
+        self._tor_ts = now
+        threading.Thread(target=self._fetch_tor, daemon=True, name="tor-feed").start()
+
+    def _fetch_tor(self) -> None:
+        """The Tor Project publishes exit nodes, not guard/entry nodes."""
+        cache = os.path.join(_STATE_DIR, "tor-exits.txt")
+        try:
+            text = ""
+            source = ""
+            if os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 86400:
+                with open(cache, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+                source = "cached list"
+            if not text:
+                r = _http.get("https://check.torproject.org/torbulkexitlist", timeout=8)
+                r.raise_for_status()
+                text = r.text
+                os.makedirs(_STATE_DIR, exist_ok=True)
+                with open(cache, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                source = "live list"
+            ips = {ln.strip() for ln in text.splitlines()
+                   if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ln.strip())}
+            if not ips:
+                raise ValueError("empty list")
+            with self._lk:
+                self._tor = ips
+            self._tor_status = f"{source}: {len(ips)} exit nodes"
+        except Exception as e:
+            self._tor_status = f"unavailable ({type(e).__name__})"
+
+    # ── Address helpers ──────────────────────────────────────────────────────
+    def is_local(self, ip: str) -> bool:
+        try:
+            if ip in get_local_ips():
+                return True
+            return bool(self._net and ipaddress.ip_address(ip) in self._net)
+        except (ValueError, TypeError):
+            return False
+
+    def _role(self, ip: str) -> str:
+        now = time.time()
+        hit = self._role_cache.get(ip)
+        if hit and now - hit[0] < 60:
+            return hit[1]
+        with _lock:
+            d = devices.get(ip) or {}
+            ports = {p for p, i in (d.get("open_ports") or {}).items()
+                     if isinstance(i, dict) and i.get("state") == "open"}
+            dtype = (d.get("device_type") or "")
+        role = "unknown"
+        if ip and ip == self.gateway:
+            role = "gateway"
+        elif len(ports & DC_PORTS) >= 2:
+            role = "dc"
+        elif ports & DB_PORTS:
+            role = "server"
+        elif 25 in ports or 587 in ports:
+            role = "mail"
+        elif "server" in dtype.lower() or "nas" in dtype.lower():
+            role = "server"
+        elif dtype in IOT_TYPES:
+            role = "iot"
+        elif ports & {135, 445, 3389} or any(x in dtype.lower() for x in ("pc", "laptop", "desktop")):
+            role = "workstation"
+        elif ports & {22, 80, 443}:
+            role = "server"
+        self._role_cache[ip] = (now, role)
+        return role
+
+    def _criticality(self, ip: str) -> str:
+        role = self._role(ip)
+        with _lock:
+            d = devices.get(ip) or {}
+            ports = {p for p, i in (d.get("open_ports") or {}).items()
+                     if isinstance(i, dict) and i.get("state") == "open"}
+            vulns = d.get("vulnerabilities") or []
+        if role in ("gateway", "dc"):
+            return "CRITICAL"
+        if any(v.get("severity") == "CRITICAL" for v in vulns):
+            return "HIGH"
+        if ports & {23, 3389, 5900}:
+            return "HIGH"
+        if role in ("server", "mail"):
+            return "MEDIUM"
+        return "LOW"
+
+    def _ti_hit(self, ip: str) -> bool:
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(a in n for n in self._ti_nets if n.version == a.version)
+
+    def _geo(self, ip: str) -> str:
+        """Opt-in enrichment (NETRON_GEO=1).  Cached result only; lookups are
+        performed asynchronously so an alert never blocks on a network call."""
+        if not self._geo_enabled or not _is_public_ip(ip):
+            return ""
+        hit = self._geo_cache.get(ip)
+        if hit is not None:
+            return hit
+        if ip not in self._geo_queue:
+            self._geo_queue.append(ip)
+        return ""
+
+    def _geo_worker(self) -> None:
+        if not REQUESTS_OK or not self._geo_queue:
+            return
+        ip = self._geo_queue.popleft()
+        try:
+            r = _http.get(f"http://ip-api.com/json/{ip}", timeout=5,
+                          params={"fields": "status,country,countryCode,as"})
+            j = r.json()
+            val = ""
+            if j.get("status") == "success":
+                asn = (j.get("as") or "").strip()
+                val = ", ".join(x for x in (j.get("country"), asn) if x)
+            self._geo_cache[ip] = val
+        except Exception:
+            self._geo_cache[ip] = ""
+
+    def bandwidth_baselines(self) -> Dict[str, dict]:
+        """Per-host 60 s byte totals and the learned baseline, for the UI."""
+        now = time.time()
+        out: Dict[str, dict] = {}
+        with self._lk:
+            for ip, b in self._bw.items():
+                w_out = b["out"] + sum(o for t, o, _i in b["closed"] if t > now - DET_BW_WINDOW)
+                w_in  = b["in"]  + sum(i for t, _o, i in b["closed"] if t > now - DET_BW_WINDOW)
+                out[ip] = {"window_out": w_out, "window_in": w_in,
+                           "baseline_out": int((b["ewma"] or 0.0) * (DET_BW_WINDOW / 10.0)),
+                           "samples": b["samples"]}
+        return out
+
+    def top_flows(self, limit: int = 12) -> List[dict]:
+        with self._lk:
+            rows = [dict(f) for f in self._flows.values()
+                    if f["bytes_out"] + f["bytes_in"] > 0]
+        rows.sort(key=lambda f: f["bytes_out"] + f["bytes_in"], reverse=True)
+        out = []
+        for f in rows[:limit]:
+            out.append({"src": f["src"], "dst": f["dst"], "dport": f["dport"],
+                        "proto": f["proto"], "bytes_in": f["bytes_in"],
+                        "bytes_out": f["bytes_out"], "packets": f["pkts"],
+                        "first": f["first"], "last": f["last"],
+                        "domain": f.get("domain", "")})
+        return out
+
+    # ── Inventory / scan hooks ───────────────────────────────────────────────
+    def observe_host(self, ip: str, mac: str, vendor: str = "") -> None:
+        if not mac or mac.upper() in ("N/A", ""):
+            return
+        new = inventory_mark(mac, ip, vendor)
+        if not new or not self._inv_preexisting:
+            return
+        if time.time() - self.started < 180:
+            return                       # warm-up: existing devices are not "new"
+        if _is_random_mac(mac):
+            return                       # privacy-randomised client MAC: noise
+        inv = inventory_get(mac)
+        self._emit("NEW_MAC", ip, "",
+                   f"MAC {mac.upper()} ({vendor or 'unknown vendor'}) not in the asset "
+                   f"inventory; first seen {inv.get('first_seen','now')}")
+
+    def observe_ports(self, ip: str, open_ports: dict) -> None:
+        # Port keys arrive as ints from the scanners and as strings after a
+        # JSON round-trip; normalise once so set arithmetic never mixes types.
+        seen: Dict[int, dict] = {}
+        for p, i in (open_ports or {}).items():
+            if not isinstance(i, dict) or i.get("state") != "open":
+                continue
+            try:
+                seen[int(p)] = i
+            except (TypeError, ValueError):
+                continue
+        ports = set(seen)
+        with self._lk:
+            prev = self._ports_seen.get(ip)
+            self._ports_seen[ip] = ports
+        if prev is None:
+            return
+        risky = ports & (set(ADMIN_PORTS) | DB_PORTS | {23, 2375, 11211})
+        new_risky = risky - prev
+        if new_risky:
+            # Name the service each port answers with, so the alert matches the
+            # Open Ports panel instead of quoting bare numbers.
+            self._emit("NEW_DEVICE_PORT", ip, "",
+                       "previously closed admin/database port(s) now open: " +
+                       ", ".join(f"{p} {service_label(p, seen[p].get('service',''))}"
+                                 for p in sorted(new_risky)))
+
+    # ── Packet ingestion ─────────────────────────────────────────────────────
+    def on_packet(self, ev: dict) -> None:
+        now = float(ev.get("ts") or time.time())
+        pending: List[tuple] = []
+        with self._lk:
+            self._packets += 1
+            self.capture_seen = True
+            self._account_bytes(ev, now)
+            self._check_scan(ev, now, pending)
+            self._check_l2(ev, now, pending)
+            self._check_dns(ev, now, pending)
+            self._check_windows(ev, now, pending)
+            self._check_policy(ev, now, pending)
+            self._check_flows(ev, now, pending)
+        for p in pending:
+            self._emit(*p)
+
+    def _account_bytes(self, ev: dict, now: float) -> None:
+        size = int(ev.get("size") or 0)
+        if not size:
+            return
+        for ip, field in ((ev.get("src"), "out"), (ev.get("dst"), "in")):
+            if not ip or not self.is_local(ip):
+                continue
+            b = self._bw.get(ip)
+            if b is None:
+                if len(self._bw) > 4096:
+                    return
+                b = {"start": now, "out": 0, "in": 0, "closed": deque(maxlen=360),
+                     "ewma": None, "samples": 0}
+                self._bw[ip] = b
+            b[field] += size
+
+    def _check_scan(self, ev: dict, now: float, pending: List[tuple]) -> None:
+        proto = ev.get("proto")
+        src, dst = ev.get("src", ""), ev.get("dst", "")
+        flags = int(ev.get("flags") or 0)
+        if proto == "TCP" and (flags & 0x02) and not (flags & 0x10):
+            fq = self._syn_all.get(src)
+            if fq is None:
+                if len(self._syn_all) > SYN_MAX_SOURCES:
+                    self._syn_all = {k: v for k, v in self._syn_all.items()
+                                     if v and v[-1] > now - SYN_WINDOW_SECS}
+                    if len(self._syn_all) > SYN_MAX_SOURCES:
+                        return
+                fq = self._syn_all[src] = deque(maxlen=ANOMALY_THRESH * 8)
+            fq.append(now)
+            fn = sum(1 for t in fq if t > now - SYN_WINDOW_SECS)
+            if fn and fn % ANOMALY_THRESH == 0:
+                pending.append(("SYN_FLOOD", src, "",
+                                f"{fn} SYN packets in {SYN_WINDOW_SECS}s"))
+            dq = self._syn.get(src)
+            if dq is None:
+                if len(self._syn) > 4096:
+                    return
+                dq = self._syn[src] = deque(maxlen=4096)
+            dq.append((now, dst, int(ev.get("dport") or 0)))
+            if len(dq) % 3:
+                return
+            win = [x for x in dq if x[0] > now - DET_SCAN_WINDOW]
+            hosts: Dict[str, set] = {}
+            for _t, h, p in win:
+                hosts.setdefault(h, set()).add(p)
+            if not hosts:
+                return
+            total_ports = sum(len(v) for v in hosts.values())
+            if len(hosts) >= DET_SCAN_HOSTS and total_ports / len(hosts) <= DET_SCAN_BREADTH:
+                pending.append(("PORT_SCAN_HORIZONTAL", src, "",
+                                f"{len(hosts)} hosts contacted on {total_ports} ports in "
+                                f"{DET_SCAN_WINDOW}s (SYN)"))
+            vertical = [(h, len(p)) for h, p in hosts.items() if len(p) >= DET_SCAN_PORTS]
+            if vertical:
+                h, n = max(vertical, key=lambda x: x[1])
+                pending.append(("PORT_SCAN_VERTICAL", src, h,
+                                f"{n} distinct ports probed on {h} in {DET_SCAN_WINDOW}s (SYN)"))
+            if self._role(src) == "iot":
+                telnet_hosts = {h for h, p in hosts.items() if p & {23, 2323}}
+                if len(telnet_hosts) >= 5:
+                    pending.append(("IOT_TELNET_SCAN", src, "",
+                                    f"IoT-role host sent Telnet SYNs to {len(telnet_hosts)} hosts "
+                                    f"in {DET_SCAN_WINDOW}s"))
+        if proto == "TCP" and (flags & 0x04):
+            dq = self._rst.get(src)
+            if dq is None:
+                if len(self._rst) > 4096:
+                    return
+                dq = self._rst[src] = deque(maxlen=2048)
+            dq.append((now, dst))
+            win = [x for x in dq if x[0] > now - DET_RST_WINDOW]
+            if len(win) >= DET_RST_BURST and len({d for _t, d in win}) >= 5:
+                pending.append(("RST_BURST", src, "",
+                                f"{len(win)} RST packets to {len({d for _t, d in win})} hosts "
+                                f"in {DET_RST_WINDOW}s (probe pattern)"))
+            rx = self._rst_rx.get(dst)
+            if rx is None:
+                if len(self._rst_rx) > 4096:
+                    return
+                rx = self._rst_rx[dst] = deque(maxlen=2048)
+            rx.append((now, src))
+            win_rx = [x for x in rx if x[0] > now - DET_RST_WINDOW]
+            if len(win_rx) >= DET_RST_BURST and len({s for _t, s in win_rx}) >= 5:
+                pending.append(("RST_BURST", dst, "",
+                                f"{len(win_rx)} RST replies from {len({s for _t, s in win_rx})} "
+                                f"sources in {DET_RST_WINDOW}s -- host is being probed"))
+        if proto == "ICMP":
+            size = int(ev.get("size") or 0)
+            if size >= DET_ICMP_BIG:
+                dq = self._icmp_big.get(src)
+                if dq is None:
+                    if len(self._icmp_big) > 2048:
+                        return
+                    dq = self._icmp_big[src] = deque(maxlen=256)
+                dq.append(now)
+                if sum(1 for t in dq if t > now - 60) == 1:
+                    pending.append(("ICMP_LARGE_PAYLOAD", src, dst,
+                                    f"{size} byte ICMP packet (possible ICMP tunnel)"))
+        if proto == "ICMP" and int((ev.get("icmp") or {}).get("type", -1)) == 3:
+            dq = self._icmp.get(src)
+            if dq is None:
+                if len(self._icmp) > 2048:
+                    return
+                dq = self._icmp[src] = deque(maxlen=2048)
+            dq.append(now)
+            n = sum(1 for t in dq if t > now - DET_ICMP_WINDOW)
+            if n >= DET_ICMP_BURST:
+                pending.append(("ICMP_UNREACH_BURST", src, "",
+                                f"{n} ICMP unreachable messages in {DET_ICMP_WINDOW}s"))
+
+    def _check_l2(self, ev: dict, now: float, pending: List[tuple]) -> None:
+        arp = ev.get("arp")
+        if arp:
+            ip, mac = arp.get("psrc", ""), (arp.get("hwsrc") or "").upper()
+            if ip and mac:
+                seen = self._arp_ip.setdefault(ip, {})
+                seen[mac] = now
+                fresh = [m for m, t in seen.items() if now - t < 120]
+                if len(fresh) >= 2:
+                    pending.append(("ARP_IP_CONFLICT", ip, "",
+                                    f"IP answered by MACs {', '.join(sorted(fresh))}"))
+                if self.gateway and ip == self.gateway:
+                    if self._gw_mac is None and self._role(ip) != "unknown":
+                        self._gw_mac = mac
+                    elif self._gw_mac and mac != self._gw_mac:
+                        old, self._gw_mac = self._gw_mac, mac
+                        pending.append(("ARP_GATEWAY_CHANGE", ip, "",
+                                        f"gateway MAC {old} -> {mac}"))
+            if arp.get("gratuitous"):
+                dq = self._garp.get(ip)
+                if dq is None:
+                    if len(self._garp) > 2048:
+                        return
+                    dq = self._garp[ip] = deque(maxlen=1024)
+                dq.append(now)
+                n = sum(1 for t in dq if t > now - DET_ARP_WINDOW)
+                if n >= DET_ARP_FLOOD:
+                    pending.append(("ARP_GRATUITOUS_FLOOD", ip, "",
+                                    f"{n} gratuitous ARP frames in {DET_ARP_WINDOW}s"))
+            vlan = ev.get("vlan")
+            if vlan and self._restricted_vlans:
+                self._host_vlan[ip] = int(vlan)
+                if int(vlan) in self._restricted_vlans:
+                    pending.append(("VLAN_RESTRICTED", ip, "",
+                                    f"host seen on restricted VLAN {vlan}"))
+        dhcp = ev.get("dhcp")
+        if dhcp:
+            mac = (dhcp.get("mac") or "").upper()
+            fp = dhcp.get("opts") or ""
+            if mac and fp:
+                prev = self._dhcp_fp.get(mac)
+                self._dhcp_fp[mac] = fp
+                if prev and prev != fp:
+                    pending.append(("DHCP_FINGERPRINT_CHANGE", ev.get("src", ""), "",
+                                    f"DHCP option fingerprint changed for {mac}: {prev} -> {fp}"))
+            if int(dhcp.get("msg_type") or 0) in (2, 5):
+                src = ev.get("src", "")
+                allowed = set(self._dhcp_ok)
+                if self.gateway:
+                    allowed.add(self.gateway)
+                allowed |= get_local_ips()
+                if src and src not in allowed:
+                    gw = dhcp.get("router") or ""
+                    pending.append(("DHCP_ROGUE_SERVER", src, "",
+                                    f"DHCP {'OFFER' if dhcp.get('msg_type') == 2 else 'ACK'} from "
+                                    f"unauthorised server" + (f" (offers router {gw})" if gw else "")))
+
+    def _check_dns(self, ev: dict, now: float, pending: List[tuple]) -> None:
+        dns = ev.get("dns")
+        if not dns:
+            return
+        src, dst = ev.get("src", ""), ev.get("dst", "")
+        qname = (dns.get("qname") or "").lower().rstrip(".")
+        if dns.get("nbtns"):
+            if dns.get("response") and src not in self._llmnr_ok:
+                self._llmnr_note(src, now, pending, f"NBT-NS response from {src}")
+            return
+        response = bool(dns.get("response"))
+        if not response:
+            if qname and self._honeypots and qname in self._honeypots:
+                pending.append(("HONEYPOT_QUERY", src, "",
+                                f"decoy name '{qname}' queried"))
+            qtype = int(dns.get("qtype") or 0)
+            labels = [l for l in qname.split(".") if l]
+            base = _dns_base(qname)
+            label = max(labels, key=len) if labels else ""
+            dq = self._dns.get(src)
+            if dq is None:
+                if len(self._dns) > 4096:
+                    return
+                dq = self._dns[src] = deque(maxlen=600)
+            dq.append((now, base, label, qtype))
+            win = [x for x in dq if x[0] > now - DET_DNS_WINDOW]
+            if qtype in (16, 10):
+                n = sum(1 for _t, b, _l, qt in win if b == base and qt in (16, 10))
+                if n >= DET_DNS_TXT_COUNT:
+                    pending.append(("DNS_TXT_VOLUME", src, "",
+                                    f"{n} {DNS_QTYPES.get(qtype, qtype)} queries for {base} "
+                                    f"in {DET_DNS_WINDOW}s"))
+            if len(labels) >= 3 and len(label) >= DET_DNS_ENT_MINLEN \
+                    and _entropy_bits(label) >= DET_DNS_ENT_BITS:
+                subs = {l for _t, b, l, _q in win if b == base and len(l) >= DET_DNS_ENT_MINLEN}
+                if len(subs) >= DET_DNS_ENT_COUNT:
+                    pending.append(("DNS_ENTROPY", src, "",
+                                    f"{len(subs)} high-entropy subdomains under {base} in "
+                                    f"{DET_DNS_WINDOW}s (example: {label[:40]}...)"))
+            if self._rdap_enabled and base and len(labels) >= 2:
+                if base not in self._rdap_cache and len(self._rdap_queue) < 200:
+                    if base not in {b for b, _c, _t in self._rdap_queue}:
+                        self._rdap_queue.append((base, src, now))
+        else:
+            if int(dns.get("rcode") or 0) == 3:
+                dq = self._nx.get(dst)
+                if dq is None:
+                    if len(self._nx) > 4096:
+                        return
+                    dq = self._nx[dst] = deque(maxlen=600)
+                dq.append(now)
+                n = sum(1 for t in dq if t > now - DET_DNS_WINDOW)
+                if n >= DET_DNS_NX_COUNT:
+                    pending.append(("DNS_NXDOMAIN_BURST", dst, "",
+                                    f"{n} NXDOMAIN responses to this host in {DET_DNS_WINDOW}s"))
+            if qname and self._honeypots and qname in self._honeypots:
+                if src not in get_local_ips() and src not in self._dhcp_ok and src != self.gateway:
+                    pending.append(("HONEYPOT_ANSWERED", src, dst,
+                                    f"decoy name '{qname}' answered by {src}"))
+            if int(ev.get("sport") or 0) == 5355:
+                if src not in self._llmnr_ok:
+                    self._llmnr_note(src, now, pending, f"LLMNR response from {src}")
+            if int(dns.get("size") or 0) > DET_DNS_BIG_UDP:
+                pending.append(("DNS_LARGE_PAYLOAD", dst or src, "",
+                                f"{int(dns['size'])} byte DNS response for {qname or '?'}"))
+
+    def _llmnr_note(self, src: str, now: float, pending: List[tuple], detail: str) -> None:
+        dq = self._llmnr.get(src)
+        if dq is None:
+            if len(self._llmnr) > 2048:
+                return
+            dq = self._llmnr[src] = deque(maxlen=64)
+        dq.append(now)
+        pending.append(("LLMNR_RESPONSE", src, "",
+                        detail + " (legitimate responders: configure NETRON_LLMNR_RESPONDERS)"))
+
+    def _check_windows(self, ev: dict, now: float, pending: List[tuple]) -> None:
+        src, dst = ev.get("src", ""), ev.get("dst", "")
+        smb = ev.get("smb")
+        if smb:
+            cmd = int(smb.get("cmd") or -1)
+            if cmd in (5, 9, 17):                       # CREATE / WRITE / SET_INFO
+                dq = self._smb_ops.get(src)
+                if dq is None:
+                    if len(self._smb_ops) > 2048:
+                        return
+                    dq = self._smb_ops[src] = deque(maxlen=4096)
+                dq.append(now)
+                n = sum(1 for t in dq if t > now - 60)
+                if n >= DET_SMB_OPS:
+                    pending.append(("SMB_MASS_FILE_OPS", src, dst,
+                                    f"{n} SMB create/write/metadata operations in 60s"))
+            share = (smb.get("share") or "").upper()
+            if share in ("C$", "ADMIN$"):
+                pending.append(("SMB_ADMIN_SHARE", src, dst,
+                                f"tree connect to \\\\{dst or '?'}\\{share}"))
+            if smb.get("signing_enabled") is False:
+                prev = self._smb_sign.get(dst)
+                self._smb_sign[dst] = (now, False)
+                if not prev or now - prev[0] > 3600:
+                    pending.append(("SMB_SIGNING_DISABLED", dst, "",
+                                    "SMB2 negotiate reports signing not enabled"))
+        if ev.get("proto") == "TCP" and int(ev.get("dport") or 0) == 445 \
+                and (int(ev.get("flags") or 0) & 0x02) and not (int(ev.get("flags") or 0) & 0x10):
+            dq = self._smb_sess.get(src)
+            if dq is None:
+                if len(self._smb_sess) > 2048:
+                    return
+                dq = self._smb_sess[src] = deque(maxlen=1024)
+            dq.append(now)
+            n = sum(1 for t in dq if t > now - 60)
+            if n >= DET_SMB_SESSIONS:
+                pending.append(("SMB_SESSION_SPIKE", src, "",
+                                f"{n} new SMB sessions in 60s"))
+        krb = ev.get("krb")
+        if krb:
+            mtype = int(krb.get("msg_type") or 0)
+            if mtype == 13:                             # TGS-REQ
+                dq = self._krb_tgs.get(src)
+                if dq is None:
+                    if len(self._krb_tgs) > 2048:
+                        return
+                    dq = self._krb_tgs[src] = deque(maxlen=1024)
+                dq.append(now)
+                n = sum(1 for t in dq if t > now - 60)
+                if n >= DET_KRB_TGS:
+                    pending.append(("KRB_TGS_BURST", src, "",
+                                    f"{n} Kerberos TGS requests in 60s"))
+            if 23 in (krb.get("etypes") or []):
+                pending.append(("KRB_RC4", src, dst,
+                                f"Kerberos message type {mtype} requests RC4 (etype 23)"))
+        if ev.get("rpc") == "drsuapi" and self._role(src) != "dc":
+            pending.append(("DCERPC_DRSUAPI", src, dst,
+                            "DCE/RPC bind to the DRSUAPI interface from a non-DC host"))
+
+    def _check_policy(self, ev: dict, now: float, pending: List[tuple]) -> None:
+        src, dst = ev.get("src", ""), ev.get("dst", "")
+        dport = int(ev.get("dport") or 0)
+        name = (ev.get("sni") or "").lower().rstrip(".")
+        dns = ev.get("dns")
+        if dns and not dns.get("response") and not dns.get("nbtns"):
+            name = name or (dns.get("qname") or "").lower().rstrip(".")
+        is_syn = ev.get("proto") == "TCP" and (int(ev.get("flags") or 0) & 0x02) \
+            and not (int(ev.get("flags") or 0) & 0x10)
+        if name:
+            hit = _domain_match(name, MINING_HOSTS)
+            if hit or ev.get("stratum"):
+                pending.append(("MINING_STRATUM", src, dst,
+                                f"mining protocol/host '{name or hit}'"))
+            hit = _domain_match(name, RMM_HOSTS)
+            if hit and not _domain_match(name, self._approved_rmm or frozenset()):
+                pending.append(("RMM_REMOTE_ACCESS", src, dst,
+                                f"remote-management service '{hit}' contacted ({name})"))
+            hit = _domain_match(name, DOH_HOSTS)
+            if hit and not _domain_match(name, self._approved_doh or frozenset()):
+                pending.append(("DOH_UNSANCTIONED", src, dst,
+                                f"DNS-over-HTTPS endpoint '{hit}' ({name})"))
+            hit = _domain_match(name, CLOUD_UPLOAD_HOSTS)
+            if hit and ev.get("sni"):
+                pending.append(("CLOUD_UPLOAD", src, dst,
+                                f"TLS session to cloud/paste service '{hit}' -- volume checked",
+                                {"severity": "LOW", "confidence": "low"}))
+        if ev.get("http") and dport and dport not in HTTP_PORTS:
+            pending.append(("WEB_ODD_PORT", src, dst,
+                            f"HTTP {ev['http']} request on non-standard port {dport}"))
+        if is_syn and _is_public_ip(dst) and dst in self._tor:
+            pending.append(("TOR_EXIT", src, dst, f"TCP connection to Tor exit node {dst}"))
+        if is_syn and dport in (25, 587) and self._role(src) not in ("mail",):
+            pending.append(("SMTP_OUTBOUND", src, dst,
+                            f"direct SMTP connection to {dst}:{dport} from a non-mail host"))
+        if is_syn and dport in (445, 3389, 5985, 5986, 22) and src != dst:
+            rs, rd = self._role(src), self._role(dst)
+            if rs == "workstation" and rd == "workstation":
+                sev = "LOW" if dport == 22 else "MEDIUM"
+                pending.append(("LATERAL_W2W", src, dst,
+                                f"workstation-to-workstation {ADMIN_PORTS.get(dport, dport)} "
+                                f"connection to {dst}:{dport}", {"severity": sev}))
+        if is_syn and _is_public_ip(src) and self.is_local(dst) \
+                and dport in (set(ADMIN_PORTS) | DB_PORTS | {8080, 8443}):
+            pending.append(("INBOUND_EXTERNAL_ADMIN", src, dst,
+                            f"inbound {ADMIN_PORTS.get(dport, dport)} to {dst}:{dport} from "
+                            f"public address {src}"))
+
+    def _check_flows(self, ev: dict, now: float, pending: List[tuple]) -> None:
+        proto = ev.get("proto")
+        src, dst = ev.get("src", ""), ev.get("dst", "")
+        if not src or not dst or proto not in ("TCP", "UDP"):
+            return
+        key = (src, dst, int(ev.get("sport") or 0), int(ev.get("dport") or 0), proto)
+        f = self._flows.get(key)
+        if f is None:
+            if len(self._flows) > 20000:
+                return
+            f = {"src": src, "dst": dst, "sport": key[2], "dport": key[3],
+                 "proto": proto, "first": now, "last": now, "pkts": 0,
+                 "bytes_out": 0, "bytes_in": 0, "session_bytes": 0,
+                 "starts": deque(maxlen=16), "sizes": deque(maxlen=16),
+                 "domain": ""}
+            self._flows[key] = f
+            self.flow_count += 1
+        f["last"] = now
+        f["pkts"] += 1
+        size = int(ev.get("size") or 0)
+        if src == key[0]:
+            f["bytes_out"] += size
+            f["session_bytes"] += size
+        else:
+            f["bytes_in"] += size
+        if ev.get("sni"):
+            f["domain"] = ev["sni"].lower()
+        flags = int(ev.get("flags") or 0)
+        if proto == "TCP" and (flags & 0x02) and not (flags & 0x10):
+            if f["session_bytes"] > 0:
+                f["sizes"].append(f["session_bytes"])
+            f["session_bytes"] = 0
+            f["starts"].append(now)
+
+    # ── Authentication log events ────────────────────────────────────────────
+    def observe_auth(self, src: str, user: str, ok: bool, service: str = "SSH") -> None:
+        if not src:
+            return
+        now = time.time()
+        pending: List[tuple] = []
+        with self._lk:
+            self._obs["auth_events"] += 1
+            dq = self._auth.get(src)
+            if dq is None:
+                if len(self._auth) > 4096:
+                    return
+                dq = self._auth[src] = deque(maxlen=400)
+            dq.append((now, user, ok))
+            recent = [x for x in dq if now - x[0] <= DET_AUTH_WINDOW]
+            if ok:
+                fails = [u for t, u, o in recent if not o]
+                if len(fails) >= 5:
+                    who = ", ".join(sorted(set(fails))[:4])
+                    pending.append(("AUTH_SUCCESS_AFTER_FAIL", src, "",
+                                    f"{service} login for '{user}' succeeded after "
+                                    f"{len(fails)} failed attempts ({who})"))
+            else:
+                users: Dict[str, int] = defaultdict(int)
+                for _t, u, o in recent:
+                    if not o:
+                        users[u] += 1
+                total = sum(users.values())
+                if total >= DET_AUTH_FAILS:
+                    pending.append(("AUTH_BRUTE_FORCE", src, "",
+                                    f"{total} failed {service} logins in {DET_AUTH_WINDOW}s"))
+                if len(users) >= DET_AUTH_USERS:
+                    pending.append(("AUTH_PASSWORD_SPRAY", src, "",
+                                    f"failed logins for {len(users)} distinct accounts in "
+                                    f"{DET_AUTH_WINDOW}s"))
+            ud = self._auth_user.get(user)
+            if ud is None:
+                if len(self._auth_user) > 4096:
+                    return
+                ud = self._auth_user[user] = {}
+            sd = ud.get(src)
+            if sd is None:
+                sd = ud[src] = deque(maxlen=64)
+            sd.append(now)
+            if not ok:
+                srcs = [s for s, d in ud.items() if any(t > now - 600 for t in d)]
+                if len(srcs) >= DET_AUTH_SRCS:
+                    # One alert per account per 10 minutes: the condition is
+                    # account-wide, so re-firing for every additional source
+                    # would just duplicate the same finding.
+                    if now - self._auth_distr.get(user, 0.0) > 600:
+                        if len(self._auth_distr) > 4096:
+                            self._auth_distr.clear()
+                        self._auth_distr[user] = now
+                        pending.append(("AUTH_DISTRIBUTED", src, "",
+                                        f"account '{user}' targeted from {len(srcs)} sources in 10m"))
+        for p in pending:
+            self._emit(*p)
+
+    # ── Periodic evaluation (baselines, beacons, feeds) ──────────────────────
+    def tick(self) -> None:
+        now = time.time()
+        pending: List[tuple] = []
+        with self._lk:
+            for ip, b in list(self._bw.items()):
+                while now - b["start"] >= 10:
+                    b["closed"].append((b["start"], b["out"], b["in"]))
+                    prev = b["ewma"]
+                    b["ewma"] = b["out"] if prev is None else (0.9 * prev + 0.1 * b["out"])
+                    b["samples"] += 1
+                    b["start"] += 10
+                    b["out"] = b["in"] = 0
+                if b["samples"] < 6:
+                    continue
+                w_out = b["out"] + sum(o for t, o, _i in b["closed"] if t > now - DET_BW_WINDOW)
+                exp   = (b["ewma"] or 0.0) * (DET_BW_WINDOW / 10.0)
+                big   = w_out >= DET_BW_MIN_BYTES
+                if not big or (exp > 0 and w_out < DET_BW_FACTOR * exp):
+                    continue
+                peer = self._top_peer(ip, now)
+                hour = datetime.now().hour
+                off  = hour < BUSINESS_START or hour >= BUSINESS_END
+                rule = "BW_OFF_HOURS" if off else "BW_OUTLIER"
+                pending.append((rule, ip, "",
+                                f"{_fmt(w_out)} outbound in {DET_BW_WINDOW}s vs baseline "
+                                f"{exp/1048576:.1f} MB/{DET_BW_WINDOW}s; top peer "
+                                f"{peer or 'n/a'}"))
+            for key, f in list(self._flows.items()):
+                if f["last"] < now - 900:
+                    del self._flows[key]
+                    continue
+                dom = f.get("domain") or ""
+                if dom and _domain_match(dom, CLOUD_UPLOAD_HOSTS) and f["bytes_out"] >= 2 * 1024 * 1024:
+                    pending.append(("CLOUD_UPLOAD", f["src"], f["dst"],
+                                    f"{_fmt(f['bytes_out'])} uploaded to {dom} "
+                                    f"({f['dst']}:{f['dport']})"))
+                if (f["last"] - f["first"] >= DET_LONG_FLOW_SECS
+                        and f["bytes_out"] + f["bytes_in"] < 1024 * 1024
+                        and _is_public_ip(f["dst"])):
+                    pending.append(("FLOW_LONG_LOW_VOLUME", f["src"], f["dst"],
+                                    f"session to {f['dst']}:{f['dport']} open "
+                                    f"{(f['last']-f['first'])/60:.0f} min with "
+                                    f"{_fmt(f['bytes_out']+f['bytes_in'])}"))
+                starts = list(f["starts"])
+                sizes  = [s for s in f["sizes"] if s > 0]
+                if len(starts) >= DET_BEACON_MIN and _is_public_ip(f["dst"]):
+                    gaps = [b - a for a, b in zip(starts, starts[1:])]
+                    if len(gaps) >= 4:
+                        mean = statistics.mean(gaps)
+                        sd   = statistics.pstdev(gaps)
+                        cv   = sd / mean if mean > 0 else 9.0
+                        msz  = statistics.mean(sizes) if len(sizes) >= 4 else 0.0
+                        scv  = (statistics.pstdev(sizes) / msz) if msz > 0 else 9.0
+                        if cv <= DET_BEACON_IV_CV and scv <= DET_BEACON_SIZE_CV:
+                            pending.append(("FLOW_BEACON", f["src"], f["dst"],
+                                            f"{len(starts)} connections to {f['dst']}:{f['dport']} "
+                                            f"every {mean:.1f}s (jitter {sd:.2f}s), "
+                                            f"{msz:.0f}B avg session"))
+            if len(self._flows) > 20000:
+                keep = sorted(self._flows.items(), key=lambda kv: kv[1]["last"], reverse=True)[:15000]
+                self._flows = dict(keep)
+            # bound the dedupe table
+            for k in [k for k, v in self._suppress.items() if now - v["last"] > 7200]:
+                self._suppress.pop(k, None)
+        for p in pending:
+            self._emit(*p)
+        # optional enrichment feeds (never block the capture path)
+        if self._geo_enabled and self._geo_queue:
+            threading.Thread(target=self._geo_worker, daemon=True, name="geo").start()
+        if self._rdap_enabled and self._rdap_queue:
+            threading.Thread(target=self._rdap_tick, daemon=True, name="rdap").start()
+
+    def _top_peer(self, ip: str, now: float) -> str:
+        best, best_b = "", 0
+        for f in self._flows.values():
+            if f["src"] == ip and f["last"] > now - 600 and f["bytes_out"] > best_b:
+                best, best_b = f"{f['dst']}:{f['dport']}", f["bytes_out"]
+        return best
+
+    def _rdap_tick(self) -> None:
+        if not self._rdap_queue or not REQUESTS_OK:
+            return
+        base, client, _seen = self._rdap_queue.popleft()
+        try:
+            r = _http.get(f"https://rdap.org/domain/{base}", timeout=6,
+                          headers={"Accept": "application/rdap+json"})
+            if r.status_code != 200:
+                self._rdap_cache[base] = None
+                self._rdap_status = f"HTTP {r.status_code} from RDAP"
+                return
+            events = r.json().get("events") or []
+            reg = next((e.get("eventDate") for e in events
+                        if e.get("eventAction") == "registration"), None)
+            if not reg:
+                self._rdap_cache[base] = None
+                return
+            dt = datetime.fromisoformat(reg.replace("Z", "+00:00"))
+            age = (datetime.now(dt.tzinfo) - dt).days
+            self._rdap_cache[base] = age
+            self._rdap_status = "ok"
+            if 0 <= age <= 30:
+                self._emit("NEW_DOMAIN", client, "",
+                           f"{base} was registered {age} day(s) ago ({reg})")
+        except Exception as e:
+            self._rdap_cache[base] = None
+            self._rdap_status = f"unavailable ({type(e).__name__})"
+
+    # ── Alert emission: dedupe, rate-limit, correlate, enrich ────────────────
+    def _incident(self, src: str, family: str, now: float) -> Tuple[str, bool]:
+        ent = self._inc_src.get(src)
+        if ent and now - ent["last"] <= 900:
+            ent["families"].add(family)
+            ent["last"] = now
+            return ent["id"], len(ent["families"]) >= 2
+        iid = "INC-" + os.urandom(3).hex().upper()
+        self._inc_src[src] = {"id": iid, "families": {family}, "first": now, "last": now}
+        if len(self._inc_src) > 500:
+            oldest = min(self._inc_src.items(), key=lambda kv: kv[1]["last"])[0]
+            self._inc_src.pop(oldest, None)
+        return iid, False
+
+    def _emit(self, rule_id: str, src: str, dst: str = "", detail: str = "",
+              extra: Optional[dict] = None) -> None:
+        rule = RULES.get(rule_id)
+        if not rule:
+            return
+        extra = dict(extra or {})
+        now   = time.time()
+        key   = (rule_id, src, dst or "")
+        with self._em_lk:
+            sup = self._suppress.get(key)
+            if sup and now - sup["last"] < rule["cooldown"]:
+                sup["last"] = now
+                sup["count"] += 1
+                aid, count = sup["alert"], sup["count"]
+                update = True
+            else:
+                dq = self._rate.setdefault(rule_id, deque(maxlen=128))
+                while dq and dq[0] < now - 3600:
+                    dq.popleft()
+                if len(dq) >= rule["rate"]:
+                    self._suppressed += 1
+                    return
+                dq.append(now)
+                update = False
+                aid, count = "", 1
+            incident, correlated = self._incident(src, rule["family"], now)
+        if update:
+            self._bump_alert(aid, count)
+            return
+        sev = extra.pop("severity", None) or rule["severity"]
+        if correlated:
+            sev = _sev_up(sev)
+        enrich = self._enrich(src)
+        if dst:
+            enrich["peer"] = self._enrich(dst)
+        a = add_alert(src or dst or "network", rule["title"], detail, sev,
+                      rule=rule_id, attack=rule["attack"], action=rule["action"],
+                      family=rule["family"], src=src, dst=dst,
+                      incident=incident, correlated=bool(correlated),
+                      confidence=extra.get("confidence", "high"),
+                      enrich=enrich)
+        with self._em_lk:
+            self._suppress[key] = {"alert": a["id"], "last": now, "count": 1}
+        self._rules_fired[rule_id] += 1
+        self._obs["alerts"] += 1
+
+    @staticmethod
+    def _bump_alert(alert_id: str, count: int) -> None:
+        with _lock:
+            for a in alerts:
+                if a.get("id") == alert_id:
+                    a["count"] = count
+                    a["last_ts"] = _ts()
+                    break
+        socketio.emit("alert_update", {"id": alert_id, "count": count,
+                                       "last_ts": _ts()})
+
+    def _enrich(self, ip: str) -> dict:
+        if not ip:
+            return {}
+        with _lock:
+            d = devices.get(ip) or {}
+            info = {"hostname": d.get("hostname") or "",
+                    "vendor": d.get("vendor") or "",
+                    "type": d.get("device_type") or "",
+                    "mac": (d.get("mac") or "").upper()}
+        info["role"]    = self._role(ip)
+        info["crit"]    = self._criticality(ip)
+        info["vlan"]    = self._host_vlan.get(ip, "unknown")
+        info["owner"]   = ""
+        info["geo"]     = self._geo(ip)
+        ti = []
+        if ip in self._tor:
+            ti.append("Tor exit node")
+        if self._ti_hit(ip):
+            ti.append("TI blocklist")
+        info["ti"] = ", ".join(ti)
+        if info["mac"]:
+            inv = inventory_get(info["mac"])
+            info["owner"] = inv.get("owner", "")
+            if inv.get("criticality"):
+                info["crit"] = inv["criticality"]
+            info["inventory"] = bool(inv)
+        return info
+
+    # ── Status for the dashboard ─────────────────────────────────────────────
+    def status(self) -> dict:
+        capture = SCAPY_OK and IS_ROOT
+        auth    = AUTHLOG.status()
+        rules = []
+        for rid, r in RULES.items():
+            active, reason = True, ""
+            req = r["requires"]
+            if req == "capture":
+                if not capture:
+                    active, reason = False, "needs root + scapy (network-wide capture)"
+                elif not self.capture_seen:
+                    reason = "waiting for the first packet"
+            elif req == "authlog":
+                if not auth["active"]:
+                    active, reason = False, auth["reason"]
+            elif req == "dnsfeed":
+                if not self._rdap_enabled:
+                    active, reason = False, "disabled (set NETRON_RDAP=1)"
+                elif self._rdap_status not in ("ok", "disabled"):
+                    active, reason = False, self._rdap_status
+            elif req == "inventory":
+                if not self._inv_preexisting:
+                    active, reason = True, "baseline being learned (no alerts until populated)"
+            rules.append({"id": rid, "title": r["title"], "severity": r["severity"],
+                          "attack": r["attack"], "action": r["action"],
+                          "family": r["family"], "requires": req,
+                          "active": active, "reason": reason,
+                          "hits": self._rules_fired.get(rid, 0)})
+        return {
+            "capture": {"mode": "scapy" if capture else "psutil",
+                        "network_wide": bool(capture),
+                        "reason": "" if capture else "run as root with scapy/libpcap for network-wide rules"},
+            "authlog": auth,
+            "tor": {"enabled": self._tor_enabled, "status": self._tor_status,
+                    "nodes": len(self._tor)},
+            "ti": {"status": self._ti_status, "entries": len(self._ti_nets)},
+            "geo": {"enabled": self._geo_enabled},
+            "rdap": {"enabled": self._rdap_enabled, "status": self._rdap_status},
+            "counters": {"packets": self._packets, "flows": len(self._flows),
+                         "alerts": self._obs.get("alerts", 0),
+                         "suppressed": self._suppressed,
+                         "auth_events": self._obs.get("auth_events", 0)},
+            "rules": rules,
+        }
+
+
+class AuthLogWatcher(threading.Thread):
+    """Tails a Linux authentication log and forwards SSH auth outcomes.
+
+    Scope: sshd lines only.  RDP/SMB/LDAP/Kerberos/VPN failures live in Windows
+    event logs or DC audit logs, which this process cannot read; those rules are
+    reported as inactive rather than guessed from network traffic.
+    """
+
+    PATHS = ("/var/log/auth.log", "/var/log/secure")
+    _RE_FAIL   = re.compile(r"Failed [\w\-/]+ for (?:invalid user )?(\S+) from (\S+)")
+    _RE_ACCEPT = re.compile(r"Accepted \S+ for (\S+) from (\S+)")
+    _RE_MAX    = re.compile(r"maximum authentication attempts exceeded for "
+                            r"(?:invalid user )?(\S+) from (\S+)")
+
+    def __init__(self, engine: "DetectionEngine"):
+        super().__init__(daemon=True, name="authlog")
+        self.engine  = engine
+        self.path    = ""
+        self.active  = False
+        self.reason  = "not started"
+        self.events  = 0
+        self._fh     = None
+        self._ino    = None
+
+    def status(self) -> dict:
+        return {"active": self.active, "reason": self.reason,
+                "path": self.path, "events": self.events}
+
+    def _pick(self) -> str:
+        cands = [os.environ.get("NETRON_AUTH_LOG", "")] + list(self.PATHS)
+        for p in cands:
+            if p and os.path.isfile(p) and os.access(p, os.R_OK):
+                return p
+        return ""
+
+    def run(self) -> None:
+        self.path = self._pick()
+        if not self.path:
+            self.reason = ("no readable auth log - run as root or point "
+                           "NETRON_AUTH_LOG at /var/log/auth.log")
+            return
+        try:
+            self._fh = open(self.path, "r", errors="replace")
+            self._fh.seek(0, os.SEEK_END)      # only new events, never replay history
+            self._ino = os.fstat(self._fh.fileno()).st_ino
+        except OSError as e:
+            self.reason = f"cannot open {self.path}: {e}"
+            return
+        self.active = True
+        self.reason = f"tailing {self.path}"
+        while True:
+            line = self._fh.readline()
+            if line:
+                self._handle(line)
+                continue
+            time.sleep(1.0)
+            # reopen after log rotation
+            try:
+                if not os.path.exists(self.path) or os.stat(self.path).st_ino != self._ino:
+                    self._fh.close()
+                    self._fh = open(self.path, "r", errors="replace")
+                    self._ino = os.fstat(self._fh.fileno()).st_ino
+                    self.reason = f"reopened {self.path}"
+            except OSError:
+                pass
+
+    def _handle(self, line: str) -> None:
+        if "sshd" not in line:
+            return
+        m = self._RE_ACCEPT.search(line)
+        if m:
+            self.events += 1
+            self.engine.observe_auth(m.group(2), m.group(1), True, "SSH")
+            return
+        m = self._RE_FAIL.search(line) or self._RE_MAX.search(line)
+        if m:
+            self.events += 1
+            self.engine.observe_auth(m.group(2), m.group(1), False, "SSH")
+
+
+DETECT = DetectionEngine()
+AUTHLOG = AuthLogWatcher(DETECT)
+
+
 class PacketCapture:
     def __init__(self):
         self._running     = False
@@ -1118,6 +3235,11 @@ class PacketCapture:
         # EMIT_RATE_PPS events/second so a busy LAN can't flood the browser.
         self._emit_budget   = float(EMIT_RATE_PPS)
         self._emit_last     = time.time()
+        self._pkt_seq       = 0
+        self._obs_err_logged = False
+        # Tor Project exit-node list (official public list).  Fetched in the
+        # background; detection says "unavailable" when it cannot be loaded.
+        DETECT.refresh_feeds()
 
     def start(self, iface: Optional[str] = None):
         self._running   = True
@@ -1147,6 +3269,9 @@ class PacketCapture:
             threading.Thread(target=self._nic_loop,  daemon=True, name="cap-nic-fb").start()
 
     def _on_pkt(self, pkt):
+        # Hand the frame to the detection engine first: every parser is
+        # best-effort and must never break the display pipeline.
+        self._observe(pkt)
         # ── ARP (link-layer neighbour discovery, RFC 826) ─────────────────────
         if pkt.haslayer(ARP):
             a = pkt[ARP]
@@ -1175,14 +3300,23 @@ class PacketCapture:
             proto  = "TCP"
             sport, dport = pkt[TCP].sport, pkt[TCP].dport
             flags  = int(pkt[TCP].flags)
-            if flags & 0x02 and not (flags & 0x10):
-                self._check_syn(src)
             svc = (_app_proto(sport, dport, "tcp")
                    or self._svc_name(dport, "tcp"))
             info = f":{sport} → :{dport}" + (f" [{svc}]" if svc else "") + f"  f={flags}"
+            # VoIP signalling runs over TCP too (SIP/TLS on 5061, H.323 on 1720).
+            try:
+                voip = voip_label(sport, dport, "tcp", bytes(pkt[TCP].payload)[:64])
+            except Exception:
+                voip = ""
+            if voip:
+                info = f"{voip}  " + info
         elif pkt.haslayer(UDP):
             proto  = "UDP"
             sport, dport = pkt[UDP].sport, pkt[UDP].dport
+            try:
+                voip = voip_label(sport, dport, "udp", bytes(pkt[UDP].payload)[:64])
+            except Exception:
+                voip = ""
             if pkt.haslayer(DNS) and pkt.haslayer(DNSQR):
                 try:
                     q = pkt[DNSQR].qname.decode(errors="ignore").rstrip(".")
@@ -1193,6 +3327,8 @@ class PacketCapture:
                 svc = (_app_proto(sport, dport, "udp")
                        or self._svc_name(dport, "udp"))
                 info = f":{sport} → :{dport}" + (f" [{svc}]" if svc else "")
+                if voip:
+                    info = f"{voip}  " + info
         elif nh == 1:                                          # ICMPv4
             proto = "ICMP"
             if pkt.haslayer(ICMP):
@@ -1214,7 +3350,285 @@ class PacketCapture:
             proto = "IPv6" if pkt.haslayer(IPv6) else "OTHER"
             info  = f"proto={nh}"
 
-        self._emit(src, dst, proto, length, info, sport, dport)
+        self._emit(src, dst, proto, length, info, sport, dport,
+                   {"voip": voip} if ("voip" in locals() and voip) else None)
+
+    # ── Detection parsing ────────────────────────────────────────────────────
+    # DCE/RPC interface UUID for DRSUAPI (DCSync): e3514235-4b06-11d1-ab04-00c04fc2dcd2
+    # in on-the-wire little-endian form.
+    DRSUAPI_UUID = bytes.fromhex("354251e3064bd111ab0400c04fc2dcd2")
+
+    def _observe(self, pkt):
+        """Parse a frame for detection.  Never raises into the capture loop."""
+        if not SCAPY_OK:
+            return
+        try:
+            ev = self._parse_pkt(pkt)
+            if ev:
+                DETECT.on_packet(ev)
+        except Exception:
+            if not self._obs_err_logged:
+                self._obs_err_logged = True
+                log.warning("[Netron] detection parser error", exc_info=True)
+
+    @staticmethod
+    def _payload_bytes(p) -> bytes:
+        try:
+            return bytes(p)[:2048]
+        except Exception:
+            return b""
+
+    def _parse_pkt(self, pkt) -> Optional[dict]:
+        ev = {"ts": time.time()}
+        try:
+            if pkt.haslayer(Dot1Q):
+                ev["vlan"] = int(pkt[Dot1Q].vlan)
+        except Exception:
+            pass
+        if pkt.haslayer(ARP):
+            a = pkt[ARP]
+            ev.update(src=a.psrc, dst=a.pdst, proto="ARP", size=len(pkt),
+                      arp={"op": int(a.op), "psrc": a.psrc, "pdst": a.pdst,
+                           "hwsrc": str(a.hwsrc).upper(),
+                           "hwdst": str(a.hwdst).upper(),
+                           "gratuitous": a.psrc == a.pdst})
+            return ev
+        if pkt.haslayer(IP):
+            src, dst, nh = pkt[IP].src, pkt[IP].dst, pkt[IP].proto
+        elif pkt.haslayer(IPv6):
+            src, dst, nh = pkt[IPv6].src, pkt[IPv6].dst, pkt[IPv6].nh
+        else:
+            return None
+        ev.update(src=src, dst=dst, size=len(pkt))
+
+        if pkt.haslayer(TCP):
+            t = pkt[TCP]
+            sport, dport = int(t.sport), int(t.dport)
+            ev.update(proto="TCP", sport=sport, dport=dport, flags=int(t.flags))
+            load = self._payload_bytes(t.payload)
+            if load:
+                ev["payload_len"] = len(load)
+                if 445 in (sport, dport):
+                    smb = self._parse_smb(load)
+                    if smb:
+                        ev["smb"] = smb
+                if 88 in (sport, dport):
+                    krb = self._parse_krb(load)
+                    if krb:
+                        ev["krb"] = krb
+                if self.DRSUAPI_UUID in load:
+                    ev["rpc"] = "drsuapi"
+                if load[:1] == b"\x16":
+                    sni = self._parse_tls_sni(load)
+                    if sni:
+                        ev["sni"] = sni
+                m = re.match(rb"(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) /\S* HTTP/\d", load)
+                if m:
+                    ev["http"] = m.group(1).decode()
+                if b"mining.subscribe" in load or b"mining.authorize" in load:
+                    ev["stratum"] = True
+            if 53 in (sport, dport) and load:
+                try:
+                    n = int.from_bytes(load[:2], "big")
+                    if n and n <= len(load) - 2:
+                        d = DNS(load[2:2 + n])
+                        ev["dns"] = self._dns_dict(d, len(load) - 2)
+                except Exception:
+                    pass
+            return ev
+
+        if pkt.haslayer(UDP):
+            u = pkt[UDP]
+            sport, dport = int(u.sport), int(u.dport)
+            ev.update(proto="UDP", sport=sport, dport=dport)
+            load = self._payload_bytes(u.payload)
+            if pkt.haslayer(DNS):
+                d = pkt[DNS]
+                ev["dns"] = self._dns_dict(d, len(load))
+                return ev
+            if 137 in (sport, dport) and len(load) >= 12:
+                flags = int.from_bytes(load[2:4], "big")
+                ev["dns"] = {"nbtns": True, "response": bool(flags & 0x8000)}
+                return ev
+            if pkt.haslayer(BOOTP):
+                b = pkt[BOOTP]
+                msg_type, sig, router = 0, [], ""
+                if pkt.haslayer(DHCP):
+                    for opt in (pkt[DHCP].options or []):
+                        if not isinstance(opt, tuple) or len(opt) < 2:
+                            continue
+                        key, val = opt[0], opt[1]
+                        try:
+                            if key == "message-type":
+                                msg_type = int(val)
+                            elif key in ("param_req_list", 55):
+                                sig = list(val) if isinstance(val, (bytes, list)) else []
+                            elif key == "router":
+                                router = ".".join(str(x) for x in val) if isinstance(val, (list, tuple)) else str(val)
+                        except (TypeError, ValueError):
+                            continue
+                ev["dhcp"] = {"msg_type": msg_type,
+                              "mac": bytes(b.chaddr[:6]).hex(":").upper(),
+                              "opts": ",".join(str(int(x)) for x in sig),
+                              "router": router, "size": len(load)}
+            return ev
+
+        if nh == 1 and pkt.haslayer(ICMP):
+            ev.update(proto="ICMP", icmp={"type": int(pkt[ICMP].type),
+                                          "code": int(pkt[ICMP].code)})
+        elif nh == 58:
+            ev.update(proto="ICMPv6")
+        else:
+            ev.update(proto="OTHER")
+        return ev
+
+    def _dns_dict(self, d, size: int) -> dict:
+        qd = d.qd
+        if isinstance(qd, list):
+            qd = qd[0] if qd else None
+        qname, qtype = "", 0
+        try:
+            if qd is not None:
+                qname = qd.qname.decode(errors="ignore").rstrip(".")
+                qtype = int(qd.qtype)
+        except Exception:
+            pass
+        def _num(v) -> int:
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+        return {"qname": qname, "qtype": qtype, "rcode": _num(d.rcode),
+                "response": bool(d.qr), "ancount": _num(d.ancount), "size": size}
+
+    def _parse_smb(self, load: bytes) -> Optional[dict]:
+        if len(load) < 64 or load[:4] != b"\xfeSMB":
+            return None
+        cmd = int.from_bytes(load[12:14], "little")
+        flags = int.from_bytes(load[16:20], "little")
+        info = {"cmd": cmd, "response": bool(flags & 0x01)}
+        body = load[64:]
+        if cmd == 3:                                  # TREE_CONNECT
+            for share in ("ADMIN$", "C$"):
+                if share.encode("utf-16-le") in body:
+                    info["share"] = share
+                    break
+        if cmd == 0 and info["response"] and len(load) >= 68:
+            sec_mode = int.from_bytes(load[66:68], "little")
+            info["signing_enabled"] = bool(sec_mode & 0x02)
+        return info
+
+    @staticmethod
+    def _der_items(b: bytes) -> List[Tuple[int, bytes]]:
+        out, i = [], 0
+        while i < len(b):
+            tag = b[i]; i += 1
+            if i >= len(b):
+                break
+            ln = b[i]; i += 1
+            if ln & 0x80:
+                n = ln & 0x7f
+                if n == 0 or n > 4 or i + n > len(b):
+                    break
+                ln = int.from_bytes(b[i:i + n], "big"); i += n
+            if i + ln > len(b):
+                break
+            out.append((tag, b[i:i + ln])); i += ln
+        return out
+
+    @staticmethod
+    def _der_seq(b: bytes) -> List[Tuple[int, bytes]]:
+        if len(b) < 2 or b[0] != 0x30:
+            return []
+        i, ln = 2, b[1]
+        if ln & 0x80:
+            n = ln & 0x7f
+            if n == 0 or n > 4 or i + n > len(b):
+                return []
+            ln = int.from_bytes(b[i:i + n], "big"); i += n
+        return PacketCapture._der_items(b[i:i + ln])
+
+    @staticmethod
+    def _der_ints(b: bytes) -> List[int]:
+        """INTEGERs inside a DER element (a SEQUENCE, or an implicit tag whose
+        content is directly a SEQUENCE OF INTEGER, e.g. Kerberos etype [0])."""
+        if not b:
+            return []
+        items = PacketCapture._der_seq(b) if b[0] == 0x30 else PacketCapture._der_items(b)
+        out: List[int] = []
+        for t, v in items:
+            if t == 0x02:
+                out.append(int.from_bytes(v, "big"))
+            elif t in (0x30, 0xa0):
+                out.extend(PacketCapture._der_ints(v))
+        return out
+
+    def _parse_krb(self, load: bytes) -> Optional[dict]:
+        b = load
+        if len(b) >= 4:
+            n = int.from_bytes(b[:4], "big")
+            if b[0] == 0 and n == len(b) - 4:
+                b = b[4:]                             # TCP length prefix
+        if not b:
+            return None
+        mtype = {0x6a: 10, 0x6b: 11, 0x6c: 12, 0x6d: 13}.get(b[0])
+        if not mtype:
+            return None
+        i = 1
+        if i >= len(b):
+            return None
+        ln = b[i]; i += 1
+        if ln & 0x80:
+            n = ln & 0x7f
+            if n == 0 or n > 4 or i + n > len(b):
+                return None
+            ln = int.from_bytes(b[i:i + n], "big"); i += n
+        body = b[i:i + ln]
+        etypes: List[int] = []
+        for tag, val in self._der_seq(body):
+            if tag == 0xa4 and mtype in (10, 12):     # KDC-REQ-BODY
+                for t2, v2 in self._der_seq(val):
+                    if t2 == 0xa7:                    # etype [7] SEQUENCE OF INTEGER
+                        etypes.extend(self._der_ints(v2))
+            elif tag == 0xa6 and mtype in (11, 13):   # EncryptedData
+                for t2, v2 in self._der_seq(val):
+                    if t2 == 0xa0:                    # etype [0]
+                        etypes.extend(self._der_ints(v2))
+        return {"msg_type": mtype, "etypes": etypes}
+
+    @staticmethod
+    def _parse_tls_sni(load: bytes) -> str:
+        """Minimal TLS ClientHello server_name (SNI) extractor."""
+        try:
+            if len(load) < 6 or load[0] != 0x16 or load[5] != 0x01:
+                return ""
+            p = 5 + 4 + 2 + 32          # record + handshake header + version + random
+            if p >= len(load):
+                return ""
+            p += 1 + load[p]            # session id
+            p += 2 + int.from_bytes(load[p:p + 2], "big")      # cipher suites
+            if p >= len(load):
+                return ""
+            p += 1 + load[p]            # compression methods
+            if p + 2 > len(load):
+                return ""
+            end = min(len(load), p + 2 + int.from_bytes(load[p:p + 2], "big"))
+            p += 2
+            while p + 4 <= end:
+                etype = int.from_bytes(load[p:p + 2], "big")
+                elen  = int.from_bytes(load[p + 2:p + 4], "big")
+                p += 4
+                if etype == 0 and p + 5 <= end:          # server_name
+                    # server_name_list: 2-byte length, then entries of
+                    # name_type(1 byte) + length(2 bytes) + name.
+                    q = p + 2
+                    nlen = int.from_bytes(load[q + 1:q + 3], "big")
+                    name = load[q + 3:q + 3 + nlen].decode("ascii", errors="ignore")
+                    return name.lower().rstrip(".")
+                p += elen
+        except Exception:
+            pass
+        return ""
 
     @staticmethod
     def _svc_name(port: int, transp: str) -> str:
@@ -1253,8 +3667,17 @@ class PacketCapture:
                     try: svc = socket.getservbyport(dport, proto.lower())
                     except Exception: pass
                     info = f":{sport} → :{dport}" + (f"  [{svc}]" if svc else "")
-                    est  = 64 + (dport % 1400)
-                    self._emit(src, dst, proto, est, info, sport, dport)
+                    # VoIP is labelled from the socket's ports only: without the
+                    # payload there is no evidence for RTP/RTCP dynamic ports, so
+                    # those stay unlabelled in this mode instead of being guessed.
+                    voip = voip_label(sport, dport, proto.lower())
+                    if voip:
+                        info = f"{voip}  " + info
+                    # Byte size is genuinely unknown from the socket table: report
+                    # 0 rather than inventing a packet length that would then be
+                    # summed into per-device bandwidth and charts.
+                    self._emit(src, dst, proto, 0, info, sport, dport,
+                               {"voip": voip} if voip else None)
             except Exception:
                 pass
             time.sleep(1)
@@ -1281,28 +3704,34 @@ class PacketCapture:
                         if d_out > 0:
                             self._emit(local_ip, "(internet)", "SEND", d_out,
                                        f"{nic}  ↑{_fmt(d_out)}/s  {p_out}p", None, None)
-                        with _lock:
-                            net_stats["total_in"]  += d_in
-                            net_stats["total_out"] += d_out
+                        # NIC counters are the single source of truth for the
+                        # global totals – _emit() only updates per-device bytes,
+                        # otherwise every byte was counted twice.
                     self._prev_nic[nic] = s
             except Exception:
                 pass
             time.sleep(1)
 
     # ── Shared emit ───────────────────────────────────────────────────────────
-    def _emit(self, src, dst, proto, length, info, sport, dport):
+    def _emit(self, src, dst, proto, length, info, sport, dport, extra=None):
         rec = {"ts":_sts(),"src":src,"dst":dst,"proto":proto,
                "len":length,"info":info,"sport":sport,"dport":dport}
+        if extra:
+            rec.update(extra)
         with _lock:
+            # Global feed: every captured packet, regardless of whether both
+            # endpoints are known devices (that is what a packet list must show).
+            self._pkt_seq += 1
+            rec["seq"] = self._pkt_seq
+            pkt_feed.appendleft(rec)
             for ip in (src, dst):
                 if ip in devices:
                     packet_log[ip].appendleft(rec)
                     if ip == src:
                         devices[ip]["bytes_out"] = devices[ip].get("bytes_out",0) + length
-                        net_stats["total_out"]  += length
                     else:
                         devices[ip]["bytes_in"]  = devices[ip].get("bytes_in", 0) + length
-                        net_stats["total_in"]   += length
+            # net_stats totals are owned exclusively by _nic_loop().
             self._pkt_count += 1
             # Instantaneous packets-per-second (1-second sliding window)
             now = time.time()
@@ -1324,15 +3753,6 @@ class PacketCapture:
             # Lightweight topology event for the network graph
             socketio.emit("topo_packet", {"src":src,"dst":dst,"proto":proto,"len":length})
 
-    def _check_syn(self, src: str):
-        syn_counters[src] += 1
-        # Alert on the threshold and re-alert on every subsequent full window
-        # (modulo) so an ongoing flood isn't reported only once, ever.
-        if syn_counters[src] > 0 and syn_counters[src] % ANOMALY_THRESH == 0:
-            add_alert(src, "SYN Flood Detected",
-                      f"Excessive SYN packets from {src} "
-                      f"({syn_counters[src]} and counting)", "HIGH")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  NETWORK MONITOR  (orchestrator)
@@ -1344,7 +3764,13 @@ class NetworkMonitor:
         self.gateway, self.network = get_local_network()
         self._running = False
         # Thread pool for parallel deep-scans (limit concurrency)
-        self._scan_pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="deep")
+        self._scan_pool = ThreadPoolExecutor(max_workers=max(4, SCAN_WORKERS),
+                                             thread_name_prefix="deep")
+        # IPs queued/running in the deep-scan pool + a hard cap on outstanding
+        # work, so a slow sweep can never grow the queue without bound.
+        self._inflight: set = set()
+        self._inflight_lock = threading.Lock()
+        self._MAX_INFLIGHT = max(64, SCAN_WORKERS * 3)
 
     def start(self):
         self._running = True
@@ -1355,15 +3781,117 @@ class NetworkMonitor:
         # Step 2: full nmap scan (slower, fills in ports/OS/vulns)
         threading.Thread(target=self._full_scan,      daemon=True, name="scan0").start()
         threading.Thread(target=self._scan_loop,       daemon=True, name="scan-loop").start()
+        # Parallel vulnerability sweep: every online device is assessed
+        # concurrently instead of waiting its turn in the deep-scan queue.
+        threading.Thread(target=self._vuln_loop,       daemon=True, name="vuln-loop").start()
         threading.Thread(target=self._bw_loop,         daemon=True, name="bw-loop").start()
+        # Detection: tail the local auth log (SSH only) and evaluate baselines
+        # on a fixed cadence.  Both threads say they are inactive when the
+        # telemetry they need is missing -- they never fake coverage.
+        if not AUTHLOG.is_alive():
+            AUTHLOG.start()
+        threading.Thread(target=self._detect_loop, daemon=True, name="detect-tick").start()
         self.capture.start()
+
+    def _detect_loop(self):
+        while self._running:
+            time.sleep(5)
+            try:
+                DETECT.tick()
+            except Exception:
+                log.warning("Detection tick failed", exc_info=True)
 
     def _scan_loop(self):
         while self._running:
             time.sleep(SCAN_INTERVAL)
             self._full_scan()
 
-    def _register_arp_host(self, ip: str, mac: str) -> Optional[dict]:
+    # ── Vulnerability sweep ──────────────────────────────────────────────────
+    # Port + exposure assessment for EVERY online device, all hosts at once.
+    # The deep-scan queue also produces findings, but it serialises hostname,
+    # TTL, banner, OS and vendor lookups per host, so on a busy network the
+    # vulnerabilities panel used to fill in one device at a time.  This sweep
+    # only does what the panel needs (port scan → assess_vulns) and runs the
+    # hosts concurrently, bounded by VULN_WORKERS.
+    def _vuln_loop(self):
+        # First sweep shortly after start so the panel fills quickly, then on
+        # the configured cadence.
+        time.sleep(4)
+        while self._running:
+            try:
+                self._vuln_sweep()
+            except Exception:
+                log.warning("Vulnerability sweep failed", exc_info=True)
+            time.sleep(max(10, VULN_INTERVAL))
+
+    def _vuln_scan_host(self, ip: str):
+        """One host: fresh port scan, then the exposure assessment."""
+        ports = self.scanner.port_scan(ip)
+        return ip, ports, self.scanner.assess_vulns(ports)
+
+    def _vuln_sweep(self):
+        now = time.time()
+        try:
+            local_ips = set(get_local_ips())
+        except Exception:
+            local_ips = set()
+        with _lock:
+            candidates = [ip for ip, d in devices.items()
+                          if d.get("status") == "online" and ip not in local_ips]
+            # A host the deep scan just refreshed does not need scanning again
+            # this round -- `vuln_scanned` records when its ports were read.
+            targets = [ip for ip in candidates
+                       if now - _parse_ts(devices[ip].get("vuln_scanned")) >= VULN_INTERVAL]
+        if not targets:
+            return
+        # Don't double-scan a host the deep-scan pool is working on.
+        with self._inflight_lock:
+            busy = set(self._inflight)
+        targets = [ip for ip in targets if ip not in busy]
+        if not targets:
+            return
+        workers = max(2, min(len(targets), VULN_WORKERS))
+        results = []
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vuln") as ex:
+            try:
+                futs = [ex.submit(self._vuln_scan_host, ip) for ip in targets]
+            except RuntimeError:
+                # Pool down (interpreter shutting down) – nothing to sweep.
+                return
+            for f in as_completed(futs):
+                try:
+                    results.append(f.result())
+                except Exception as e:
+                    log.warning("Vulnerability scan failed: %s", e)
+        for ip, ports, vulns in results:
+            self._apply_vuln_scan(ip, ports, vulns)
+
+    def _apply_vuln_scan(self, ip: str, ports: dict, vulns: list) -> None:
+        """Merge one host's findings, then push the device to the UI."""
+        with _lock:
+            dev = devices.get(ip)
+            if dev is None or dev.get("status") != "online":
+                return
+            prev_ports = dev.get("open_ports") or {}
+            # Same merge rule as the deep scan: an empty or partial sweep keeps
+            # the ports we already observed open (see merge_scan_ports).
+            merged, carried = merge_scan_ports(ip, prev_ports, ports)
+            if carried:
+                # Re-assess what is still displayed (including ports this
+                # sweep did not re-probe) so findings and ports never diverge.
+                try:
+                    vulns = self.scanner.assess_vulns(merged)
+                except Exception:
+                    vulns = dev.get("vulnerabilities") or []
+            dev["open_ports"]      = merged
+            dev["vuln_count"]       = len(vulns)
+            dev["vuln_scanned"]     = _ts()
+            dev["last_seen"]        = _ts()
+            snap = dict(dev)
+        DETECT.observe_ports(ip, merged)
+        socketio.emit("device_update", snap)
+
+    def _register_arp_host(self, ip: str, mac: str, announce: bool = False) -> Optional[dict]:
         """
         Fast registration of a host discovered from the OS ARP table.
         Adds it to `devices` (if absent) and emits device_update so the UI
@@ -1405,10 +3933,11 @@ class NetworkMonitor:
                     "Windows / Android"          if ttl <= 128     else
                     "iOS / Network Device"       if ttl > 128      else
                     "Linux / Android / iOS / macOS")
-        # Apply fallbacks for display
-        dv  = vendor if vendor and vendor.lower() not in ("unknown","") else ip
-        db  = brand  if brand  and brand.lower()  not in ("unknown","") else ip
-        ddt = dtype  if dtype  and dtype.lower()  not in ("unknown","") else ip
+        # Unknown values stay empty (the UI falls back to the IP for labels).
+        # An IP address must never be stored as a vendor/brand/device type.
+        dv  = vendor if vendor and vendor.lower() not in ("unknown","") else ""
+        db  = brand  if brand  and brand.lower()  not in ("unknown","") else ""
+        ddt = dtype  if dtype  and dtype.lower()  not in ("unknown","") else ""
         entry = {
             "ip": ip, "mac": mac, "hostname": "",
             "vendor": dv, "brand": db, "device_type": ddt,
@@ -1427,6 +3956,13 @@ class NetworkMonitor:
             else:
                 return None
         socketio.emit("device_update", devices[ip])
+        # Alert only for live discoveries (announce=True), never for the
+        # startup ARP seed – otherwise booting the app spams one alert per host.
+        if announce:
+            add_alert(ip, "New Device Joined",
+                      f"{dv} ({ddt}) at {ip} — vendor from OUI, deep scan pending",
+                      "INFO")
+        DETECT.observe_host(ip, mac, dv)
         return devices[ip]
 
     def _quick_arp_seed(self):
@@ -1442,8 +3978,8 @@ class NetworkMonitor:
         # Seed all devices in parallel. The vendor APIs are rate-limited to
         # ~1 req/s, so a small pool avoids a thundering herd of threads that
         # would all just sit in the rate-limiter.
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="seed") as ex:
-            list(ex.map(lambda h: self._register_arp_host(h["ip"], h.get("mac","N/A")), hosts))
+        list(_ARP_POOL.map(
+            lambda h: self._register_arp_host(h["ip"], h.get("mac", "N/A")), hosts))
 
     def _arp_watch_loop(self):
         """
@@ -1463,10 +3999,10 @@ class NetworkMonitor:
                                if h["ip"] not in devices
                                or devices[h["ip"]].get("status") != "online"]
                     if new:
-                        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="arpwatch") as ex:
-                            list(ex.map(
-                                lambda h: self._register_arp_host(h["ip"], h.get("mac","N/A")),
-                                new))
+                        list(_ARP_POOL.map(
+                            lambda h: self._register_arp_host(
+                                h["ip"], h.get("mac", "N/A"), announce=True),
+                            new))
             except Exception:
                 pass
             time.sleep(3)
@@ -1476,35 +4012,53 @@ class NetworkMonitor:
         with _lock:
             net_stats["scan_count"] += 1
         seen = set()
-        futures = []
         # The monitoring host itself is not a device to display
         local_ips = set()
         try:
             local_ips = get_local_ips()
         except Exception:
             pass
+        now = time.time()
+        # Snapshot what is already known so the sweep can spend its workers on
+        # devices that need work instead of re-identifying every host every
+        # cycle.  Identification (PTR/mDNS/NetBIOS, banner, OS, vendor) is
+        # expensive; ports and vulnerabilities are kept fresh by the parallel
+        # vulnerability sweep.
+        with _lock:
+            known = {ip: (d.get("identified_ts"), d.get("mac"))
+                     for ip, d in devices.items()}
         for h in hosts:
             ip, mac = h["ip"], h.get("mac","N/A")
             if ip in local_ips:
                 continue   # never show/track the machine running Netron
             seen.add(ip)
-            is_new = ip not in devices
+            prev = known.get(ip)
+            if (prev and prev[1] == mac
+                    and 0 <= now - _parse_ts(prev[0]) < ID_INTERVAL):
+                continue   # identified recently – nothing to redo yet
+            # Don't queue more work than the pool can reasonably drain; the
+            # next sweep retries anything skipped here.
+            with self._inflight_lock:
+                if len(self._inflight) >= self._MAX_INFLIGHT:
+                    continue
             # lookup_vendor is fast if cached; _deep_scan will re-query if needed
             vendor, dtype, brand = lookup_vendor(mac)
-            futures.append(
+            try:
                 self._scan_pool.submit(
-                    self._deep_scan_guarded, ip, mac, vendor, dtype, brand, is_new
+                    self._deep_scan_guarded, ip, mac, vendor, dtype, brand
                 )
-            )
-        # Pre-warm vendor cache for any unknown MACs in a background thread
-        # so API calls don't block the scan timing
-        unknown_macs = [h.get("mac","N/A") for h in hosts
-                        if oui(h.get("mac","N/A")) not in _vendor_cache]
-        if unknown_macs:
-            def _prewarm():
-                for m in unknown_macs:
-                    lookup_vendor(m)   # result goes into _vendor_cache
-            threading.Thread(target=_prewarm, daemon=True, name="vendor-prewarm").start()
+            except RuntimeError:
+                # Pool already torn down (interpreter shutting down) – the sweep
+                # is worthless at that point, so stop quietly instead of
+                # dumping a traceback.
+                return
+        # Queue vendor-API work for MACs the built-in OUI table does not know.
+        # This only enqueues: the single background worker does the HTTP calls
+        # at the API's rate limit and pushes the answer to the device later.
+        for h in hosts:
+            m = h.get("mac", "N/A")
+            if oui(m) and oui(m) not in _vendor_cache and oui(m) not in OUI_TABLE:
+                lookup_vendor(m)
         # Mark offline — but only when a device was missed by TWO consecutive
         # sweeps AND hasn't been seen in the OS ARP cache within the grace
         # window. A single missed nmap result (Wi-Fi power-save, scan timeout)
@@ -1528,6 +4082,21 @@ class NetworkMonitor:
                     to_emit.append(dev)
         for dev in to_emit:
             socketio.emit("device_update", dev)
+        # Prune long-gone devices and their per-device logs so memory stays
+        # bounded (blocked devices are kept so the block survives reconnects).
+        cutoff = now - DEVICE_RETENTION_SECS
+        with _lock:
+            gone = [ip for ip, d in devices.items()
+                    if d.get("status") == "offline" and not d.get("blocked")
+                    and _arp_seen_ts.get(ip, 0) < cutoff]
+            for ip in gone:
+                devices.pop(ip, None)
+                packet_log.pop(ip, None)
+                traffic_data.pop(ip, None)
+                missed_scans.pop(ip, None)
+                _arp_seen_ts.pop(ip, None)
+        for ip in gone:
+            socketio.emit("device_removed", {"ip": ip})
 
     # ── HTTP banner grab ─────────────────────────────────────────────────────
     @staticmethod
@@ -1556,7 +4125,7 @@ class NetworkMonitor:
         for url, port in candidates[:2]:    # try up to 2 ports
             try:
                 req = _ur.Request(url, headers={"User-Agent":"Netron/3"})
-                r   = _ur.urlopen(req, timeout=3, context=ctx if "https" in url else None)
+                r   = _ur.urlopen(req, timeout=2, context=ctx if "https" in url else None)
                 hdrs = dict(r.headers)
                 # Server header (e.g. "lighttpd/1.4.45", "mini_httpd", "GoAhead")
                 srv = hdrs.get("Server","") or hdrs.get("server","")
@@ -1582,17 +4151,25 @@ class NetworkMonitor:
                 continue
         return info
 
-    def _deep_scan_guarded(self, ip, mac, vendor, dtype, brand, is_new):
+    def _deep_scan_guarded(self, ip, mac, vendor, dtype, brand):
         """
-        _deep_scan wrapper that runs in the thread pool: any unexpected error
-        is logged and contained instead of silently killing the worker.
+        _deep_scan wrapper that runs in the thread pool: deduplicates in-flight
+        scans of the same host, and contains any unexpected error instead of
+        silently killing the worker.
         """
+        with self._inflight_lock:
+            if ip in self._inflight:
+                return
+            self._inflight.add(ip)
         try:
-            self._deep_scan(ip, mac, vendor, dtype, brand, is_new)
+            self._deep_scan(ip, mac, vendor, dtype, brand)
         except Exception as e:
             log.warning("Deep scan failed for %s: %s", ip, e)
+        finally:
+            with self._inflight_lock:
+                self._inflight.discard(ip)
 
-    def _deep_scan(self, ip, mac, vendor, dtype, brand, is_new):
+    def _deep_scan(self, ip, mac, vendor, dtype, brand):
         """
         Full per-device scan pipeline:
           1. Reverse DNS / mDNS hostname
@@ -1604,12 +4181,8 @@ class NetworkMonitor:
           7. Refine device_type using ALL signals
           8. Vulnerability assessment
         """
-        # 1. Reverse DNS hostname
-        hostname = ""
-        try:
-            hostname = socket.gethostbyaddr(ip)[0]
-        except Exception:
-            pass
+        # 1. Hostname: PTR, then the host's own mDNS / NetBIOS answer (cached).
+        hostname = resolve_hostname(ip)
 
         # 2. TTL (quick – run before port scan so OS family is known early)
         ttl = self.scanner.ping_ttl(ip)
@@ -1620,25 +4193,29 @@ class NetworkMonitor:
         # 4. HTTP banner – fetch before OS detection so banner can inform it
         banner = self._http_banner(ip, open_ports)
 
-        # 4b. Refine vendor from banner when OUI lookup failed
-        if banner and (not vendor or vendor.lower() in ("unknown","")):
-            for field in ("server","auth_realm","title"):
-                val = banner.get(field,"")
-                if val:
-                    guessed = _guess_type(val)
-                    if guessed != "Unknown":
-                        vendor = val.split("/")[0].strip()
-                        dtype  = guessed
-                        brand  = vendor
-                        break
+        # 4b. The HTTP Server/auth-realm strings name *software* or a product
+        #     line ("mini_httpd", "lighttpd", "GoAhead"), not the manufacturer,
+        #     and a model name in a realm is not a company name either.  Using
+        #     them as vendor/brand would invent a manufacturer, so banner data
+        #     only feeds device_type below.
 
         # 4c. Deep vendor re-lookup if still unknown (tries live API)
         if not vendor or vendor.lower() in ("unknown",""):
             vendor, dtype, brand = lookup_vendor(mac)
 
-        # 5. OS detection — vendor/banner signals first, then nmap, then TTL
-        nmap_os, nmap_acc = self.scanner.nmap_os(ip)
-        if nmap_os:
+        # 5. OS detection — vendor OUI first, then nmap, then hostname/ports/TTL.
+        #    A High-confidence vendor answer is authoritative for consumer gear
+        #    (nmap -O is unreliable on phones, printers and IoT), and skipping
+        #    the nmap probe when it is not needed saves the most expensive
+        #    identification step.
+        os_v, conf_v = infer_os_from_vendor(vendor, dtype)
+        vendor_confident = bool(os_v) and conf_v.startswith("High")
+        nmap_os, nmap_acc = ("", "")
+        if not vendor_confident:
+            nmap_os, nmap_acc = self.scanner.nmap_os(ip)
+        if vendor_confident:
+            final_os, os_acc = os_v, conf_v
+        elif nmap_os:
             final_os, os_acc = nmap_os, f"nmap {nmap_acc}"
         else:
             # Build a richer hostname by combining DNS + banner title/realm
@@ -1662,6 +4239,10 @@ class NetworkMonitor:
 
         # 6. Refine device_type with all signals (vendor, OS, ports, banner)
         final_dtype = _refine_dtype(dtype, vendor, final_os, open_ports, hostname)
+        # The host that answers as this subnet's default gateway is, by
+        # definition, a router/gateway — that is an observation, not a guess.
+        if self.gateway and ip == self.gateway and final_dtype in ("Unknown", "", ip):
+            final_dtype = "Router / Switch"
         # Banner title/server can disambiguate type further
         if banner and final_dtype in ("Unknown", ip, ""):
             for field in ("auth_realm","title","server"):
@@ -1682,6 +4263,12 @@ class NetworkMonitor:
 
         with _lock:
             existing = devices.get(ip, {})
+            # One merge rule for every scan path, so this panel, the
+            # Vulnerabilities panel and the alerts always agree.
+            open_ports, carried = merge_scan_ports(
+                ip, existing.get("open_ports") or {}, open_ports)
+            if carried:
+                vulns = self.scanner.assess_vulns(open_ports)
             # Preserve blocked state across rescans
             currently_blocked = existing.get("blocked", False) or (ip in blocked_devices)
 
@@ -1693,12 +4280,15 @@ class NetworkMonitor:
                 elif ttl > 128:                 display_os = "iOS / Network Device"
                 else:                           display_os = "Linux / Android / iOS / macOS"
 
-            # ── Device type fallback: use IP when truly unknown ───────────────
-            display_dtype = final_dtype if (final_dtype and final_dtype.lower() not in ("unknown", "")) else ip
-
-            # ── Vendor fallback: use IP when truly unknown ────────────────────
-            display_vendor = vendor if (vendor and vendor.lower() not in ("unknown", "")) else ip
-            display_brand  = brand  if (brand  and brand.lower()  not in ("unknown", "")) else ip
+            # Unknown values stay empty; the UI falls back to the IP for labels
+            # and prints "Unknown" in detail views.
+            display_dtype  = final_dtype if (final_dtype and final_dtype.lower() not in ("unknown", "")) else existing.get("device_type", "")
+            display_vendor = vendor if (vendor and vendor.lower() not in ("unknown", "")) else existing.get("vendor", "")
+            display_brand  = brand  if (brand  and brand.lower()  not in ("unknown", "")) else existing.get("brand", "")
+            # Never let a previous IP-as-vendor placeholder survive
+            if display_vendor == ip: display_vendor = ""
+            if display_brand  == ip: display_brand  = ""
+            if display_dtype  == ip: display_dtype  = ""
 
             devices[ip] = {
                 **existing,
@@ -1714,6 +4304,10 @@ class NetworkMonitor:
                 "open_ports":  open_ports,
                 "vulnerabilities": vulns,
                 "vuln_count":  len(vulns),
+                "vuln_scanned": _ts(),
+                # When the expensive identification last completed, so the
+                # sweep can skip re-identifying this device every cycle.
+                "identified_ts": _ts(),
                 "status":      "blocked" if currently_blocked else "online",
                 "blocked":     currently_blocked,
                 "first_seen":  existing.get("first_seen", _ts()),
@@ -1724,10 +4318,10 @@ class NetworkMonitor:
             }
             missed_scans[ip]   = 0     # a successful scan is positive evidence
             _arp_seen_ts[ip]   = time.time()
+            entry = devices[ip]
 
-        if is_new:
-            add_alert(ip, "New Device Joined",
-                      f"{vendor} ({final_dtype}) at {ip} — {final_os}", "INFO")
+        # Port-open alerts are derived from the same set the panels show.
+        DETECT.observe_ports(ip, open_ports)
 
         crit = [v for v in vulns if v["severity"] in ("CRITICAL","HIGH")]
         if crit:
@@ -1735,7 +4329,7 @@ class NetworkMonitor:
                       "; ".join(f":{v['port']} {v['service']}" for v in crit[:3]),
                       "CRITICAL")
 
-        socketio.emit("device_update", devices[ip])
+        socketio.emit("device_update", entry)
 
     def _bw_loop(self):
         """Push per-device bandwidth deltas to the graphs every second."""
@@ -1753,6 +4347,19 @@ class NetworkMonitor:
                     traffic_data[ip].append({"ts":ts_now,"in":di,"out":do})
                     snap[ip] = {"in":di,"out":do}
             socketio.emit("traffic_update", {"ts":ts_now,"data":snap})
+            # Push the real aggregate counters periodically – without this the
+            # header/Pkt-s cards never change after initial_state.
+            if not hasattr(self, "_stats_tick"):
+                self._stats_tick = 0
+            self._stats_tick += 1
+            if self._stats_tick % 5 == 0:
+                with _lock:
+                    stats = {**net_stats, "gateway": self.gateway,
+                             "network": self.network,
+                             "device_count": len(devices),
+                             "online": sum(1 for d in devices.values()
+                                           if d.get("status") == "online")}
+                socketio.emit("stats_update", stats)
 
 
 # Hostnames that definitively mean "this is a PC / desktop computer"
@@ -1783,31 +4390,71 @@ def _refine_dtype(dtype: str, vendor: str, os_str: str, ports: dict,
     dt_l  = (dtype  or "").lower()
     open_set = {p for p, i in ports.items() if i.get("state") == "open"}
 
+    def vendor_has(*names: str) -> bool:
+        # Whole-word match: "vivo" must not match Vivotek, "hp" must not match
+        # a substring of some unrelated company name.
+        return any(re.search(r"\b" + re.escape(n) + r"\b", v_l) for n in names)
+
+    # A TTL-only OS guess lists several candidates, e.g. "Linux / Android / macOS".
+    # Such a guess must never decide the device type on its own: it would turn a
+    # router into a Mac or a TV into a phone.  Only an unambiguous OS string is
+    # allowed to pick an OS-specific type; otherwise the type stays Unknown.
+    os_strong = os_l if (os_l and "/" not in os_l and " or " not in os_l) else ""
+
+    # ── Strong port signals first ─────────────────────────────────────────────
+    # A listening raw-print service is a printer even when its hostname looks
+    # like a PC.  CUPS (631) alone is common on desktops, so 631 only counts
+    # together with a printer vendor.
+    if open_set & {9100, 515}:
+        return "Printer"
+    if 631 in open_set and vendor_has("hp", "hewlett", "canon", "epson", "brother",
+                                      "xerox", "ricoh", "lexmark", "kyocera",
+                                      "konica", "oki", "samsung"):
+        return "Printer"
+    # AFP (548) or NFS (2049) means this host serves files to the network.
+    if open_set & {548, 2049}:
+        return "NAS / Server"
+    # RTSP is used by cameras/NVRs; do not claim it for a Windows/macOS host.
+    if (open_set & {554, 8554}) and "windows" not in os_l and "macos" not in os_l \
+            and "windows" not in dt_l and "mac" not in dt_l:
+        return "IP Camera"
+    # A host exposing a database port is serving, but a developer laptop
+    # running MySQL is still a laptop: only call it a server when the OS is not
+    # a desktop/mobile platform.
+    if open_set & DB_PORTS and not any(x in os_strong for x in
+                                      ("macos", "windows", "ios", "android")):
+        return "Server"
+
     # ── Hostname-based PC detection (highest priority for generic names) ───────
     if _hostname_implies_pc(hostname):
         # Determine if Linux or Windows PC from OS string
-        if any(x in os_l for x in ("kali", "parrot", "linux", "ubuntu",
-                                    "debian", "fedora", "centos", "arch",
-                                    "manjaro", "mint")):
+        if any(x in os_strong for x in ("kali", "parrot", "linux", "ubuntu",
+                                         "debian", "fedora", "centos", "arch",
+                                         "manjaro", "mint")):
             return "Linux PC"
-        if "windows" in os_l or "win" in os_l:
+        if "windows" in os_strong or "win" in os_strong:
             return "Windows PC"
-        if "macos" in os_l:
+        if "macos" in os_strong:
             return "Mac"
         # Default: treat generic hostnames as PC
         return "PC"
 
+    # ── Self-reported platform in the hostname ────────────────────────────────
+    # A device advertising "Android-4.local" over mDNS is naming its own OS.
+    if "android" in (hostname or "").lower():
+        return "Mobile Phone"
+
     # ── iOS / iPadOS ──────────────────────────────────────────────────────────
-    if "ipadose" in os_l or "ipados" in os_l:
+    if "ipados" in os_strong:
         return "iPad"
-    if os_l == "ios" or "ios" in os_l and "macos" not in os_l:
+    if os_strong == "ios" or ("ios" in os_strong and "macos" not in os_strong):
         # Differentiate iPhone vs iPad by vendor device_type if available
         if "ipad" in dt_l:
             return "iPad"
         return "iPhone"
 
     # ── macOS ─────────────────────────────────────────────────────────────────
-    if "macos" in os_l:
+    if "macos" in os_strong:
         if "macbook" in dt_l:
             return "MacBook (Laptop)"
         if any(x in dt_l for x in ("imac", "mac pro", "mac mini")):
@@ -1817,29 +4464,29 @@ def _refine_dtype(dtype: str, vendor: str, os_str: str, ports: dict,
     # ── Android ───────────────────────────────────────────────────────────────
     if "android tv" in os_l or "tizen" in os_l:
         return "Smart TV"
-    if "android" in os_l:
+    if "android" in os_strong:
         if "tablet" in dt_l:
             return "Android Tablet"
         return "Mobile Phone"
 
     # ── Windows ───────────────────────────────────────────────────────────────
-    if "windows server" in os_l:
+    if "windows server" in os_strong:
         return "Windows Server"
-    if "windows" in os_l:
+    if "windows" in os_strong:
         if 3389 in open_set:
             return "Windows PC (RDP)"   # remote desktop exposed
         return "Windows PC"
 
     # ── Linux ─────────────────────────────────────────────────────────────────
-    if "raspberry pi" in os_l:
+    if "raspberry pi" in os_strong:
         return "IoT / SBC"
+    # ── Network / Router ──────────────────────────────────────────────────────
+    # Router/AP firmware commonly self-reports "Network OS" or "Embedded
+    # Linux", so this check must come BEFORE any IoT classification.
     if "embedded linux" in os_l and "camera" in os_l:
         return "IP Camera"
-    if "embedded linux" in os_l:
-        return "IoT Device"
-
-    # ── Network / Router ──────────────────────────────────────────────────────
-    if "network os" in os_l or "router" in os_l or "embedded linux" in os_l:
+    if ("network os" in os_l or "router" in os_l
+            or "embedded linux" in os_l or "openwrt" in os_l):
         return "Router / Switch"
 
     # ── Gaming Consoles ───────────────────────────────────────────────────────
@@ -1863,16 +4510,16 @@ def _refine_dtype(dtype: str, vendor: str, os_str: str, ports: dict,
         return "Virtual Machine"
 
     # ── Vendor-based fallback (when OS is still Unknown) ──────────────────────
-    if any(x in v_l for x in _ANDROID_VENDORS):
+    if vendor_has(*_ANDROID_VENDORS):
         return "Mobile Phone"
-    if "apple" in v_l:
+    if vendor_has("apple"):
         return "Apple Device"
-    if any(x in v_l for x in ("cisco", "ubiquiti", "mikrotik", "netgear",
-                               "tp-link", "d-link", "zyxel")):
+    if vendor_has("cisco", "ubiquiti", "mikrotik", "netgear", "tp-link",
+                  "d-link", "zyxel"):
         return "Router / Switch"
-    if any(x in v_l for x in ("hikvision", "dahua", "axis", "wyze", "reolink")):
+    if vendor_has("hikvision", "dahua", "axis", "wyze", "reolink", "vivotek"):
         return "IP Camera"
-    if any(x in v_l for x in ("epson", "canon", "hp", "brother", "xerox")):
+    if vendor_has("epson", "canon", "hp", "hewlett", "brother", "xerox"):
         return "Printer"
 
     return dtype or "Unknown"
@@ -1901,8 +4548,8 @@ def get_device_activities(ip: str) -> dict:
 
     # ── Process packets ──────────────────────────────────────────────────────
     dest_counter: Dict[str, int] = defaultdict(int)
-    endpoint_counter: Dict[str, int] = defaultdict(int)
-    dns_queries: Dict[str, str] = {}         # domain → resolved IP
+    endpoint_counter: Dict[Tuple[int, str], int] = defaultdict(int)  # (port, proto) → hits
+    dns_queries: Dict[str, str] = {}         # domain → "" (answer IP is not observable here)
     connections: list = []
     ts_buckets: Dict[str, int] = defaultdict(int)  # "HH:MM" → count
     proto_counter: Dict[str, int] = defaultdict(int)
@@ -1926,20 +4573,18 @@ def get_device_activities(ip: str) -> dict:
         if other and other != ip:
             dest_counter[other] += 1
 
-        # Extract endpoint (port)
+        # Extract endpoint (port) – keep the port numeric and the protocol
+        # separate; resolve the service name with the *actual* protocol.
         if dport:
-            try:
-                svc = socket.getservbyport(dport, "tcp") if dport < 1024 else ""
-            except Exception:
-                svc = ""
-            ep_key = f":{dport}" + (f" ({svc})" if svc else "")
-            endpoint_counter[ep_key] += 1
+            endpoint_counter[(int(dport), (proto or "TCP").lower())] += 1
 
-        # Detect DNS queries from info field
-        if "DNS" in info and info.startswith("DNS"):
-            domain = info.replace("DNS", "").strip()
+        # Detect DNS queries from info field. The packet log only carries the
+        # query name, not the answer, so the resolved IP is unknown ("") –
+        # storing the resolver IP here made the DNS server look like the site.
+        if info.startswith("DNS"):
+            domain = info.replace("DNS", "", 1).strip()
             if domain:
-                dns_queries[domain] = other or ""
+                dns_queries[domain] = ""
 
         # Time bucket (group by second for the graph)
         if ts_str:
@@ -1977,8 +4622,16 @@ def get_device_activities(ip: str) -> dict:
     sites_visited = sorted(sites_map.values(), key=lambda x: -x["count"])[:30]
 
     # ── Build endpoints (sorted by frequency) ───────────────────────────────
-    endpoints = [{"port": k, "count": v}
-                 for k, v in sorted(endpoint_counter.items(), key=lambda x: -x[1])[:20]]
+    def _svc(port: int, proto: str) -> str:
+        try:
+            return socket.getservbyport(port, proto)
+        except Exception:
+            return ""
+
+    endpoints = [{"port": port, "proto": proto.upper(),
+                  "service": _svc(port, proto), "count": n}
+                 for (port, proto), n in
+                 sorted(endpoint_counter.items(), key=lambda kv: -kv[1])[:20]]
 
     # ── Summary ──────────────────────────────────────────────────────────────
     summary = {
@@ -2307,34 +4960,43 @@ def _unblock_device(ip: str, mac: str) -> List[str]:
 @app.route("/api/block/<ip>", methods=["POST"])
 @require_auth
 def api_block(ip):
-    d = devices.get(ip)
+    with _lock:
+        d = dict(devices[ip]) if ip in devices else None
     if not d: return jsonify({"error": "unknown IP"}), 404
     if d.get("is_gateway"):
         return jsonify({"error": "Cannot block the gateway"}), 400
+    if ip in blocked_devices:
+        return jsonify({"ok": True, "message": f"{ip} is already blocked",
+                        "root": IS_ROOT})
+
+    # Never claim a block that was not actually applied – that used to leave a
+    # permanently "blocked" device in the UI on non-root runs.
+    if not IS_ROOT:
+        return jsonify({"ok": False, "root": False,
+                        "error": "Not running as root – blocking needs sudo/root."}), 403
 
     mac = d.get("mac", "N/A")
+    ok, msgs = _block_device(ip, mac)
+    detail = "; ".join(msgs[:3])
+    if not ok:
+        add_alert(ip, "Block Failed", f"Could not block {ip}: {detail}", "MEDIUM")
+        return jsonify({"ok": False, "root": IS_ROOT, "error": detail,
+                        "methods": detail}), 500
+
     blocked_devices[ip] = mac
-
-    if IS_ROOT:
-        ok, msgs = _block_device(ip, mac)
-        detail = "; ".join(msgs[:3])
-    else:
-        ok     = False
-        detail = "Not running as root – iptables unavailable. Run with sudo for real blocking."
-
     with _lock:
         if ip in devices:
             devices[ip]["blocked"] = True
             devices[ip]["status"]  = "blocked"
+        entry = dict(devices.get(ip, {}))
 
-    severity = "HIGH" if ok else "MEDIUM"
     add_alert(ip, "Device Blocked",
-              f"{d.get('vendor', ip)} ({d.get('device_type','?')}) at {ip} — {detail}",
-              severity)
-    socketio.emit("device_update", devices.get(ip, {}))
+              f"{d.get('vendor', ip)} ({d.get('device_type', '?')}) at {ip} — {detail}",
+              "HIGH")
+    socketio.emit("device_update", entry)
     return jsonify({
         "ok":      True,
-        "message": f"{ip} blocked" + (" (root — real disconnect)" if ok else " (UI only — needs root)"),
+        "message": f"{ip} blocked (rules applied)",
         "methods": detail,
         "root":    IS_ROOT,
     })
@@ -2343,23 +5005,30 @@ def api_block(ip):
 @app.route("/api/unblock/<ip>", methods=["POST"])
 @require_auth
 def api_unblock(ip):
-    mac = blocked_devices.pop(ip, devices.get(ip, {}).get("mac", "N/A"))
+    with _lock:
+        mac = blocked_devices.get(ip) or devices.get(ip, {}).get("mac", "N/A")
+        dev_blocked = bool(devices.get(ip, {}).get("blocked"))
+    if ip not in blocked_devices and not dev_blocked:
+        return jsonify({"ok": False, "error": f"{ip} is not blocked"}), 409
+    # Mirrors api_block: never report an unblock that removed nothing.
+    if not IS_ROOT:
+        return jsonify({"ok": False, "root": False,
+                        "error": "Not running as root – blocking rules need sudo/root."}), 403
 
-    if IS_ROOT:
-        msgs = _unblock_device(ip, mac)
-        detail = "; ".join(msgs[:3])
-    else:
-        detail = "Not running as root – rules not applied."
+    msgs = _unblock_device(ip, mac)
+    detail = "; ".join(msgs[:3])
 
+    blocked_devices.pop(ip, None)
     with _lock:
         if ip in devices:
             devices[ip]["blocked"] = False
             devices[ip]["status"]  = "online"
             missed_scans[ip]       = 0
+        entry = dict(devices.get(ip, {}))
 
     add_alert(ip, "Device Unblocked",
-              f"{devices.get(ip,{}).get('vendor', ip)} at {ip} reconnected", "INFO")
-    socketio.emit("device_update", devices.get(ip, {}))
+              f"{entry.get('vendor') or ip} at {ip} — block rules removed", "INFO")
+    socketio.emit("device_update", entry)
     return jsonify({
         "ok":      True,
         "message": f"{ip} unblocked",
@@ -2367,44 +5036,366 @@ def api_unblock(ip):
         "root":    IS_ROOT,
     })
 
-def _quick_jitter_ms(samples: int = 8) -> Tuple[float, float]:
+# ─────────────────────────────────────────────────────────────────────────────
+#  INTERNET SPEED & LATENCY TEST
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A real measurement has to move tens of megabytes, which takes 10-25 s, so it
+# never runs inside the HTTP request: POST starts a worker thread and the page
+# polls GET /api/speedtest for the current phase, progress and live numbers.
+# (The old version ran the whole test inside the request, so the browser sat on
+# a single fetch with no progress and no timeout - "taking forever / not
+# working".)
+#
+# Every number reported here is measured:
+#   latency  TCP handshake RTT to anycast resolvers.  DNS is resolved once,
+#            before the timed section: a cold lookup added ~300 ms to every
+#            sample and made the "ping" meaningless.  Median of the samples.
+#   jitter   mean absolute difference between consecutive RTT samples - the
+#            packet-delay variation VoIP gear reports, not the stdev of a mix
+#            of different hosts.
+#   download parallel TLS streams from speed.cloudflare.com, which exists for
+#            this purpose.  One stream is bounded by the TCP receive window:
+#            measured on this link at 3.2 Mbps for 1 stream vs 9.8 Mbps for 4
+#            streams and 6.5 Mbps for a single 10 MB file, so a single stream
+#            reports a number that is simply wrong.  Bytes/time is taken over a
+#            window that starts 0.6 s into the round, so TCP slow start and
+#            socket-buffer absorption do not inflate it.
+#   upload   parallel POSTs to the same host, timed from the first body byte
+#            until the server answers, so connect + TLS are excluded and the
+#            bytes are actually acknowledged before they are counted.
+#
+# speedtest-cli is still used first when the user installed it (it measures
+# against a real speedtest.net node); it runs as a subprocess with a hard
+# timeout so a hung server cannot wedge the worker.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SPEEDTEST_STALL_SECS = 90   # a run with no progress for this long is dead
+SPEEDTEST_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_CF_HOST     = "speed.cloudflare.com"
+_CF_DOWN     = "https://speed.cloudflare.com/__down?bytes={n}&measId={mid}"
+_CF_UP_PATH  = "/__up"
+# Plain mirrors used only when Cloudflare is unreachable.
+_DL_FALLBACKS = (
+    ("https://proof.ovh.net/files/10Mb.dat", 6_000_000),
+    ("https://download.thinkbroadband.com/10MB.zip", 6_000_000),
+)
+
+_speed_lock  = threading.Lock()
+_speed_state = {
+    "running":       False,
+    "phase":         "idle",
+    "progress":      0.0,
+    "download_mbps": 0.0,
+    "upload_mbps":   0.0,
+    "latency_ms":    0.0,
+    "jitter_ms":     0.0,
+    "result":        None,
+    "error":         "",
+    "started":       0.0,
+    "finished":      0.0,
+    "last_update":   0.0,
+}
+
+
+def _spd_set(**kw) -> None:
+    """Update the shared progress/result state (worker thread -> HTTP poller)."""
+    with _speed_lock:
+        _speed_state["last_update"] = time.time()
+        _speed_state.update(kw)
+
+
+def _spd_snapshot() -> dict:
+    with _speed_lock:
+        snap = dict(_speed_state)
+        snap["result"] = dict(snap["result"]) if snap["result"] else None
+    return snap
+
+
+def _latency_probe(hosts=(("1.1.1.1", 443), ("8.8.8.8", 443)), samples: int = 7,
+                   budget: float = 6.0):
     """
-    Measure real HTTP latency/jitter: quick GETs to a tiny 204 endpoint,
-    returning (median_ttfb_ms, jitter_stdev_ms). Values are actual
-    measurements (each sample includes TCP+TLS connection setup); when the
-    endpoint is unreachable, returns (0.0, 0.0).
+    Median TCP handshake RTT (ms) and jitter (mean |delta| between consecutive
+    samples), plus the host that answered.  Returns (0.0, 0.0, "") when no
+    resolver accepted a connection.  Bounded by `budget` seconds overall so an
+    unreachable host cannot stall the run.
     """
-    import urllib.request as _ur, time as _t, statistics as _stat
-    rtts: list = []
-    for _ in range(samples):
+    best = None
+    started = time.monotonic()
+    for host, port in hosts:
+        if time.monotonic() - started > budget:
+            break
         try:
-            t0 = _t.monotonic()
-            r = _ur.urlopen("https://www.google.com/generate_204", timeout=4)
-            r.read(64)
-            rtts.append((_t.monotonic() - t0) * 1000)
+            ip = socket.gethostbyname(host)      # untimed: DNS is not latency
+        except Exception:
+            continue
+        rtts: list = []
+        for _ in range(samples):
+            if time.monotonic() - started > budget:
+                break
+            try:
+                t0 = time.perf_counter()
+                sock = socket.create_connection((ip, port), timeout=2)
+                rtts.append((time.perf_counter() - t0) * 1000.0)
+                sock.close()
+            except Exception:
+                pass
+            time.sleep(0.04)
+        if len(rtts) >= 4:
+            med = statistics.median(rtts)
+            if best is None or med < best[0]:
+                best = (med, rtts, host)
+        if best and best[0] < 40:                # already a nearby anycast node
+            break
+    if best is None:
+        return 0.0, 0.0, "", 0
+    med, rtts, host = best
+    deltas = [abs(b - a) for a, b in zip(rtts, rtts[1:])]
+    jit = statistics.fmean(deltas) if deltas else 0.0
+    return round(med, 1), round(jit, 1), host, len(rtts)
+
+
+def _download_stream(url: str, max_bytes: int, deadline: float,
+                     counter: list, clock_lock) -> int:
+    """GET url and read up to max_bytes (or until deadline).  Returns bytes."""
+    import urllib.request as _ur
+    got, resp = 0, None
+    try:
+        resp = _ur.urlopen(_ur.Request(url, headers={"User-Agent": SPEEDTEST_UA}),
+                           timeout=max(3.0, deadline - time.monotonic()))
+        while got < max_bytes:
+            if time.monotonic() >= deadline:
+                break
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            got += len(chunk)
+            with clock_lock:
+                counter[0] += len(chunk)
+    except Exception:
+        pass
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    return got
+
+
+def _download_round(bytes_per_stream: int, streams: int, max_secs: float,
+                    progress_lo: float = 15.0, progress_hi: float = 55.0):
+    """
+    Run `streams` parallel downloads of `bytes_per_stream` each.
+    Returns (bytes_transferred, Mbps) where Mbps is measured over a window that
+    starts after the TCP warm-up, so buffer absorption cannot inflate it.
+    """
+    counter, clock_lock = [0], threading.Lock()
+    deadline = time.monotonic() + max_secs
+    threads = []
+    for _ in range(streams):
+        url = _CF_DOWN.format(n=bytes_per_stream, mid=secrets.token_hex(6))
+        th = threading.Thread(target=_download_stream,
+                              args=(url, bytes_per_stream, deadline, counter, clock_lock),
+                              daemon=True)
+        th.start()
+        threads.append(th)
+
+    time.sleep(min(0.6, max_secs * 0.3))         # let slow start settle
+    with clock_lock:
+        base_bytes, base_t = counter[0], time.monotonic()
+    while any(th.is_alive() for th in threads):
+        time.sleep(0.15)
+        elapsed = time.monotonic() - base_t
+        with clock_lock:
+            live = counter[0]
+        if elapsed > 0.25:
+            _spd_set(download_mbps=round((live - base_bytes) * 8 / elapsed / 1e6, 2),
+                     progress=round(progress_lo + (progress_hi - progress_lo)
+                                    * min(1.0, elapsed / max_secs), 1))
+        if time.monotonic() > deadline + 2:
+            break
+    for th in threads:
+        th.join(timeout=2)
+
+    end_t = time.monotonic()
+    with clock_lock:
+        total = counter[0]
+    window = end_t - base_t
+    moved  = total - base_bytes
+    mbps   = (moved * 8 / window / 1e6) if window > 0.05 and moved > 0 else 0.0
+    return total, mbps
+
+
+def _download_probe():
+    """
+    Cloudflare first (4 parallel streams, second round sized from the first);
+    plain mirrors if Cloudflare cannot be reached.
+    Returns (mbps, bytes, source).
+    """
+    total, mbps = _download_round(512_000, 4, 5.0, 15.0, 30.0)
+    if mbps > 0:
+        # size the second round from the first so it lasts about 4 s
+        per = int(mbps * 1e6 / 8 * 4.0 / 4)
+        per = max(512_000, min(8_000_000, per))
+        total, second = _download_round(per, 4, 8.0, 30.0, 55.0)
+        if second > 0:
+            mbps = second
+        return round(mbps, 2), total, "speed.cloudflare.com (4 parallel streams)"
+
+    for url, max_bytes in _DL_FALLBACKS:
+        import urllib.request as _ur
+        t0, got, resp = time.monotonic(), 0, None
+        try:
+            resp = _ur.urlopen(_ur.Request(url, headers={"User-Agent": SPEEDTEST_UA}),
+                               timeout=6)
+            while got < max_bytes:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if time.monotonic() - t0 > 6:
+                    break
         except Exception:
             pass
-        _t.sleep(0.05)
-    if len(rtts) < 3:
-        return 0.0, 0.0
-    rtts.sort()
-    trimmed = rtts[: max(3, int(len(rtts) * 0.75))]   # drop worst outliers
-    med = trimmed[len(trimmed) // 2]
-    return round(med, 1), round(_stat.stdev(trimmed), 1)
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        dt = time.monotonic() - t0
+        if got and dt > 0.1:
+            host = url.split("/")[2]
+            return round(got * 8 / dt / 1e6, 2), got, f"{host} (single stream)"
+    return 0.0, 0, ""
 
-@app.route("/api/speedtest")
-def api_speedtest():
+
+def _upload_stream(host: str, path: str, payload_bytes: int, deadline: float,
+                   counter: list, clock_lock) -> int:
+    """POST payload_bytes of zeros; returns bytes the server actually took."""
+    ctx = ssl.create_default_context()
+    sock = ssock = None
+    try:
+        sock  = socket.create_connection((host, 443), timeout=6)
+        ssock = ctx.wrap_socket(sock, server_hostname=host)
+        head = (f"POST {path} HTTP/1.1\r\nHost: {host}\r\n"
+                f"User-Agent: {SPEEDTEST_UA}\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {payload_bytes}\r\nConnection: close\r\n\r\n")
+        ssock.sendall(head.encode())
+        blob, sent = b"\0" * 65536, 0
+        while sent < payload_bytes and time.monotonic() < deadline:
+            n = min(len(blob), payload_bytes - sent)
+            ssock.sendall(blob[:n])
+            sent += n
+            with clock_lock:
+                counter[0] += n
+        # Wait for the status line: until the server answers, part of the body
+        # may still sit in the local socket buffer, which would over-report.
+        try:
+            ssock.settimeout(max(2.0, deadline - time.monotonic() + 3))
+            ssock.recv(256)
+        except Exception:
+            pass
+        return sent
+    except Exception:
+        return 0
+    finally:
+        for s in (ssock, sock):
+            try:
+                if s is not None:
+                    s.close()
+            except Exception:
+                pass
+
+
+def _upload_round(bytes_per_stream: int, streams: int, max_secs: float,
+                  progress_lo: float = 58.0, progress_hi: float = 95.0):
+    """Parallel uploads; returns (bytes_sent, Mbps over the whole round)."""
+    counter, clock_lock = [0], threading.Lock()
+    deadline = time.monotonic() + max_secs
+    t_start  = time.monotonic()
+    threads = []
+    for _ in range(streams):
+        th = threading.Thread(target=_upload_stream,
+                              args=(_CF_HOST, _CF_UP_PATH, bytes_per_stream,
+                                    deadline, counter, clock_lock),
+                              daemon=True)
+        th.start()
+        threads.append(th)
+
+    while any(th.is_alive() for th in threads):
+        time.sleep(0.2)
+        elapsed = time.monotonic() - t_start
+        if elapsed > 0.4:
+            with clock_lock:
+                live = counter[0]
+            _spd_set(upload_mbps=round(live * 8 / elapsed / 1e6, 2),
+                     progress=round(progress_lo + (progress_hi - progress_lo)
+                                    * min(1.0, elapsed / max_secs), 1))
+        if time.monotonic() > deadline + 3:
+            break
+    for th in threads:
+        th.join(timeout=2)
+
+    elapsed = time.monotonic() - t_start
+    with clock_lock:
+        total = counter[0]
+    return total, (total * 8 / elapsed / 1e6 if elapsed > 0.1 and total else 0.0)
+
+
+def _upload_probe():
+    """Cloudflare /__up, then httpbin as a fallback.  Returns (mbps, bytes, src)."""
+    total, mbps = _upload_round(512_000, 3, 8.0)
+    if mbps > 50:
+        total, second = _upload_round(4_000_000, 3, 10.0)
+        if second > 0:
+            mbps = second
+    if mbps > 0:
+        return round(mbps, 2), total, "speed.cloudflare.com (3 parallel streams)"
+
+    counter, clock_lock = [0], threading.Lock()
+    deadline = time.monotonic() + 10
+    t0 = time.monotonic()
+    sent = _upload_stream("httpbin.org", "/post", 512_000, deadline, counter, clock_lock)
+    dt = time.monotonic() - t0
+    if sent and dt > 0.1:
+        return round(sent * 8 / dt / 1e6, 2), sent, "httpbin.org (single stream)"
+    return 0.0, 0, ""
+
+
+def _speedtest_cli_json(timeout: float):
     """
-    Accurate internet speed + latency test.
-
-    Strategy (in priority order):
-    1. speedtest-cli Python API  – if installed and reachable, the gold standard
-    2. speedtest-cli CLI binary  – subprocess fallback for the Python module
-    3. Multi-endpoint HTTP probe – HTTP latency/jitter via TTFB, chunked DL/UL speed
+    Parse speedtest-cli output when the user installed it.  Runs as a
+    subprocess so a hung speedtest.net node cannot wedge the worker.
     """
-    import urllib.request as _ur
-    import time as _t, json as _json, statistics as _stat
+    cmd = None
+    if shutil.which("speedtest-cli"):
+        cmd = ["speedtest-cli", "--json", "--secure", "--timeout", "15"]
+    else:
+        try:
+            import importlib.util as _ilu
+            if _ilu.find_spec("speedtest") is not None:
+                cmd = [sys.executable, "-m", "speedtest", "--json", "--secure",
+                       "--timeout", "15"]
+        except Exception:
+            cmd = None
+    if cmd is None:
+        return None
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except Exception:
+        pass
+    return None
 
+
+def _speed_worker() -> None:
+    """Run the whole test and publish the result; never raises."""
     result = {
         "download_mbps": 0.0,
         "upload_mbps":   0.0,
@@ -2412,185 +5403,115 @@ def api_speedtest():
         "jitter_ms":     0.0,
         "server":        "",
         "isp":           "",
-        "status":        "ok",
+        "status":        "HTTP probe",
+        "method":        "",
+        "bytes_down":    0,
+        "bytes_up":      0,
     }
-
-    # ── Attempt 1: speedtest-cli Python API ───────────────────────────────────
     try:
-        import speedtest as _st
-        s = _st.Speedtest(secure=True, timeout=20)
-        s.get_best_server()
-        s.download(threads=4)
-        s.upload(threads=4, pre_allocate=False)
-        r = s.results.dict()
-        result["download_mbps"] = round(r.get("download", 0) / 1_000_000, 2)
-        result["upload_mbps"]   = round(r.get("upload",   0) / 1_000_000, 2)
-        result["latency_ms"]    = round(r.get("ping",     0), 1)
-        # speedtest-cli's results.dict() exposes no per-request latencies, so
-        # jitter cannot be derived here – measure it with real quick probes
-        # rather than inventing a value.
-        if result["jitter_ms"] == 0.0:
-            _, jit = _quick_jitter_ms()
-            result["jitter_ms"] = jit
-        srv = r.get("server", {})
-        result["server"] = f"{srv.get('name','')}, {srv.get('country','')}".strip(", ")
-        result["isp"]    = r.get("client", {}).get("isp", "")
-        result["status"] = "speedtest-cli (Python API)"
-        return jsonify(result)
-    except Exception:
-        pass
-
-    # ── Attempt 2: speedtest-cli binary ───────────────────────────────────────
-    try:
-        proc = subprocess.run(
-            ["speedtest-cli", "--json", "--secure", "--timeout", "30"],
-            capture_output=True, text=True, timeout=90, check=False
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            d = _json.loads(proc.stdout)
-            result["download_mbps"] = round(d.get("download", 0) / 1_000_000, 2)
-            result["upload_mbps"]   = round(d.get("upload",   0) / 1_000_000, 2)
-            result["latency_ms"]    = round(d.get("ping",     0), 1)
-            # --json has no jitter field – measure it with real quick probes
-            _, jit = _quick_jitter_ms()
-            result["jitter_ms"] = jit
-            srv = d.get("server", {})
-            result["server"] = f"{srv.get('name','')}, {srv.get('country','')}".strip(", ")
-            result["isp"]    = d.get("client", {}).get("isp", "")
-            result["status"] = "speedtest-cli (binary)"
-            return jsonify(result)
-    except Exception:
-        pass
-
-    # ── Attempt 3: Multi-endpoint HTTP probe ─────────────────────────────────
-    #
-    # Latency: TTFB to multiple small JSON endpoints (3 probes × 3 targets = 9 samples)
-    # – take the trimmed mean (drop top 20%) as a proxy for network RTT
-    # – jitter = stddev of trimmed samples
-    #
-    # Download: stream large files in chunks, compute throughput after a
-    # 0.3-second TCP warm-up window so the OS send-buffer doesn't inflate the result
-    #
-    # Upload: POST binary data; measure time-to-response (server discards payload)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ── Latency probes ────────────────────────────────────────────────────────
-    # Primary: median TTFB to a tiny 204 endpoint (each sample includes
-    # connection setup; the median plus the stdev give latency and jitter).
-    # Fallback: TTFB to a few JSON endpoints, in case that endpoint is
-    # blocked/unreachable.
-    med_rtt, jit = _quick_jitter_ms()
-    if med_rtt:
-        result["latency_ms"] = med_rtt
+        # ── Latency + jitter (fast, always local) ─────────────────────────
+        _spd_set(phase="latency", progress=4.0)
+        lat, jit, hop, nsamples = _latency_probe()
+        result["latency_ms"] = lat
         result["jitter_ms"]  = jit
-    else:
-        LAT_TARGETS = [
-            "https://pypi.org/pypi/pip/json",
-            "https://registry.npmjs.org/express/latest",
-            "https://pypi.org/pypi/setuptools/json",
-            "https://pypi.org/simple/pip/",
-        ]
-        raw_lats: list = []
-        for url in LAT_TARGETS:
-            for _ in range(3):
-                try:
-                    t0 = _t.monotonic()
-                    r  = _ur.urlopen(url, timeout=5)
-                    r.read(256)   # only need the first response bytes
-                    raw_lats.append((_t.monotonic() - t0) * 1000)
-                except Exception:
-                    pass
-                _t.sleep(0.04)
+        result["method"]     = (f"TCP RTT -> {hop}: median of {nsamples} connect "
+                                f"times, jitter = mean |delta| between consecutive"
+                                if hop else "TCP RTT")
+        _spd_set(latency_ms=lat, jitter_ms=jit, progress=12.0)
 
-        if raw_lats:
-            raw_lats.sort()
-            # Trim top 20% outliers (network spikes, proxy delays)
-            trim_n     = max(1, int(len(raw_lats) * 0.80))
-            trimmed    = raw_lats[:trim_n]
-            avg_lat    = sum(trimmed) / len(trimmed)
-            result["latency_ms"] = round(avg_lat, 1)
-            result["jitter_ms"]  = round(
-                _stat.stdev(trimmed) if len(trimmed) > 1 else 0.0, 1
-            )
+        # ── speedtest.net, only when speedtest-cli is installed ───────────
+        _spd_set(phase="speedtest-cli", progress=14.0)
+        cli = _speedtest_cli_json(timeout=40)
+        if cli:
+            srv = cli.get("server") or {}
+            result["download_mbps"] = round((cli.get("download") or 0) / 1e6, 2)
+            result["upload_mbps"]   = round((cli.get("upload")   or 0) / 1e6, 2)
+            if not result["latency_ms"] and cli.get("ping"):
+                result["latency_ms"] = round(cli["ping"], 1)
+            result["server"] = f"{srv.get('name','')}, {srv.get('country','')}".strip(", ")
+            result["isp"]    = (cli.get("client") or {}).get("isp", "")
+            result["status"] = "speedtest-cli"
+            _spd_set(download_mbps=result["download_mbps"],
+                     upload_mbps=result["upload_mbps"], progress=100.0)
+        else:
+            _spd_set(phase="download", progress=15.0)
+            dl, dbytes, dsrc = _download_probe()
+            result["download_mbps"] = dl
+            result["bytes_down"]    = dbytes
+            _spd_set(download_mbps=dl, progress=56.0)
 
-    # ── Download speed ────────────────────────────────────────────────────────
-    DL_TARGETS = [
-        ("https://pypi.org/simple/",                                        8_000_000),
-        ("https://files.pythonhosted.org/packages/source/r/requests/requests-2.31.0.tar.gz", 5_000_000),
-        ("https://files.pythonhosted.org/packages/source/p/pip/pip-24.0.tar.gz", 5_000_000),
-    ]
-    dl_rates: list = []
-    for url, max_bytes in DL_TARGETS:
-        try:
-            r = _ur.urlopen(url, timeout=20)
-            total   = 0
-            t_start = _t.monotonic()
-            warm_end = t_start + 0.25   # ignore the TCP warm-up window
-            measure_start = None
-            measure_bytes = 0
-            while True:
-                chunk = r.read(131_072)   # 128 KB chunks
-                if not chunk:
-                    break
-                now    = _t.monotonic()
-                total += len(chunk)
-                if now >= warm_end:
-                    if measure_start is None:
-                        measure_start = now
-                        measure_bytes = 0
-                    measure_bytes += len(chunk)
-                if total >= max_bytes:
-                    break
-            if measure_start and (elapsed := _t.monotonic() - measure_start) > 0.05:
-                rate = measure_bytes * 8 / (elapsed * 1_000_000)
-                dl_rates.append(rate)
-        except Exception:
-            pass
+            _spd_set(phase="upload", progress=58.0)
+            up, ubytes, usrc = _upload_probe()
+            result["upload_mbps"] = up
+            result["bytes_up"]    = ubytes
+            _spd_set(upload_mbps=up, progress=97.0)
 
-    if dl_rates:
-        # Use the median to be robust against outliers from small/large files
-        dl_rates.sort()
-        mid = len(dl_rates) // 2
-        result["download_mbps"] = round(
-            (dl_rates[mid-1] + dl_rates[mid]) / 2 if len(dl_rates) % 2 == 0
-            else dl_rates[mid], 2
-        )
+            hosts = {s.split(" ")[0] for s in (dsrc, usrc) if s}
+            result["server"] = (f"{hosts.pop()} (4 download / 3 upload streams)"
+                                if len(hosts) == 1
+                                else " / ".join(s for s in (dsrc, usrc) if s))
+            result["method"] = (f"{result['method']}; "
+                                f"download {dbytes/1e6:.1f} MB, "
+                                f"upload {ubytes/1e6:.1f} MB" if dbytes or ubytes
+                                else result["method"])
+            result["status"] = "HTTP probe"
 
-    # ── Upload speed ──────────────────────────────────────────────────────────
-    # POST a 1 MB payload; measure only the transfer window (not response time).
-    # Targets accept POSTed bodies (discarding them) so the send time reflects
-    # real upstream throughput.
-    UL_TARGETS = [
-        "https://httpbin.org/post",
-        "https://postman-echo.com/post",
-    ]
-    ul_rates: list = []
-    payload = bytes(1_000_000)   # 1 MB of zeros
-    for url in UL_TARGETS:
-        try:
-            req = _ur.Request(
-                url, data=payload, method="POST",
-                headers={"Content-Type": "application/octet-stream",
-                         "Content-Length": str(len(payload))}
-            )
-            t0 = _t.monotonic()
-            try:
-                _ur.urlopen(req, timeout=12)
-            except Exception:
-                pass   # server rejects POST body but we still measure the send time
-            elapsed = _t.monotonic() - t0
-            # Only count if it took long enough to be a real upload, not an instant rejection
-            if elapsed > 0.10:
-                rate = len(payload) * 8 / (elapsed * 1_000_000)
-                ul_rates.append(rate)
-        except Exception:
-            pass
+        if not (result["download_mbps"] or result["upload_mbps"] or result["latency_ms"]):
+            result["status"] = "error"
+            result["error"]  = ("No measurement succeeded - offline, or every "
+                                "test endpoint was unreachable.")
+            _spd_set(running=False, phase="error", progress=0.0,
+                     error=result["error"], finished=time.time(), result=None)
+            return
 
-    if ul_rates:
-        result["upload_mbps"] = round(sum(ul_rates) / len(ul_rates), 2)
+        _spd_set(running=False, phase="done", progress=100.0,
+                 finished=time.time(), result=result, error="")
+    except Exception as exc:                      # never leave the UI spinning
+        _spd_set(running=False, phase="error", progress=0.0,
+                 error=str(exc) or exc.__class__.__name__,
+                 finished=time.time(), result=None)
 
-    result["status"] = "HTTP probe"
-    return jsonify(result)
+
+@app.route("/api/speedtest", methods=["GET", "POST"])
+@require_auth
+def api_speedtest():
+    """
+    GET  -> current state: {running, phase, progress, live values, result, error}
+    POST -> start a measurement (returns 202 + state; force=1 bypasses cache)
+    """
+    if request.method == "GET":
+        return jsonify(_spd_snapshot())
+
+    force = request.args.get("force") == "1"
+    cached_out = None
+    with _speed_lock:
+        stale = (_speed_state["running"]
+                 and time.time() - _speed_state.get("last_update", 0) > SPEEDTEST_STALL_SECS)
+        if stale:
+            # A worker died without clearing the flag - do not wedge the panel.
+            _speed_state.update(running=False, phase="error",
+                                error="previous run stalled")
+        if _speed_state["running"]:
+            already = True
+        else:
+            already = False
+            cached, cached_time = _speed_state["result"], _speed_state["finished"]
+            if cached and not force and time.time() - cached_time < SPEEDTEST_CACHE_SECS:
+                cached_out = dict(cached)
+                cached_out["cached"] = True
+            else:
+                _speed_state.update(running=True, phase="starting", progress=0.0,
+                                    download_mbps=0.0, upload_mbps=0.0,
+                                    latency_ms=0.0, jitter_ms=0.0, error="",
+                                    started=time.time(), last_update=time.time())
+
+    if already:
+        return jsonify(_spd_snapshot()), 202          # a run is already going
+    if cached_out is not None:
+        return jsonify(cached_out)
+
+    threading.Thread(target=_speed_worker, name="speedtest", daemon=True).start()
+    return jsonify(_spd_snapshot()), 202
 
 
 
@@ -2616,30 +5537,34 @@ def api_site_favicon(host):
     cannot be retrieved (the frontend then falls back to the globe icon).
     """
     host = (host or "").strip().strip("/")
-    if not _FAVICON_HOST_RE.match(host):
+    if not SITE_ICONS_ENABLED or not _FAVICON_HOST_RE.match(host):
         return ("", 404)
-    bytes_io = _fetch_site_favicon(host)
-    if bytes_io is None:
+    fetched = _fetch_site_favicon(host)
+    if fetched is None:
         return ("", 404)
-    data = bytes_io.getvalue()
+    data, ctype = fetched
     resp = Response(data, status=200)
-    resp.headers["Content-Type"] = "image/png"
+    resp.headers["Content-Type"] = ctype
     resp.headers["Cache-Control"] = "public, max-age=86400"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 
 def _fetch_site_favicon(host: str):
-    """Fetch a favicon for host (Google s2 service), returning a BytesIO or None."""
-    if not REQUESTS_OK or not _FAVICON_HOST_RE.match(host):
+    """Fetch a host's favicon via Google's s2 service.
+
+    Returns (bytes, content_type) or None. Disabled by default because it
+    discloses every hostname observed in LAN traffic to a third party – enable
+    with NETRON_SITE_ICONS=1 if that trade-off is acceptable.
+    """
+    if not SITE_ICONS_ENABLED or not REQUESTS_OK or not _FAVICON_HOST_RE.match(host):
         return None
     try:
         from urllib.parse import quote
         url = f"https://www.google.com/s2/favicons?domain={quote(host, safe='.-')}&sz=64"
         r = _http.get(url, timeout=4, headers={"User-Agent": f"Netron/{VERSION}"})
         if r.status_code == 200 and r.content:
-            import io
-            return io.BytesIO(r.content)
+            return r.content, (r.headers.get("Content-Type") or "image/png")
     except Exception:
         pass
     return None
@@ -2647,12 +5572,13 @@ def _fetch_site_favicon(host: str):
 @app.route("/api/rescan/<ip>", methods=["POST"])
 @require_auth
 def api_rescan(ip):
-    d = devices.get(ip)
+    with _lock:
+        d = dict(devices[ip]) if ip in devices else None
     if not d: return jsonify({"error":"unknown IP"}),404
     threading.Thread(
         target=monitor._deep_scan_guarded,
         args=(ip, d.get("mac","N/A"), d.get("vendor",""),
-              d.get("device_type",""), d.get("brand",""), False),
+              d.get("device_type",""), d.get("brand","")),
         daemon=True,
     ).start()
     return jsonify({"ok":True,"message":f"Rescan queued for {ip}"})
@@ -2730,6 +5656,178 @@ def api_traffic(ip):
 def api_packets(ip):
     with _lock: return jsonify(list(packet_log.get(ip,[])))
 
+@app.route("/api/packets")
+def api_packets_all():
+    """Every captured frame (bounded ring buffer), newest last.
+
+    Filters: ?proto=TCP|UDP|ICMP|ARP|OTHER, ?src=, ?dst=, ?port=, ?limit=.
+    """
+    proto = (request.args.get("proto") or "").upper()
+    src   = (request.args.get("src") or "").strip()
+    dst   = (request.args.get("dst") or "").strip()
+    port  = request.args.get("port", "").strip()
+    try:
+        limit = max(1, min(2000, int(request.args.get("limit", "400"))))
+    except ValueError:
+        limit = 400
+    try:
+        since = int(request.args.get("since", "0"))
+    except ValueError:
+        since = 0
+    with _lock:
+        rows = list(pkt_feed)
+    def keep(r):
+        if proto and r.get("proto", "") != proto:
+            return False
+        if src and r.get("src", "") != src:
+            return False
+        if dst and r.get("dst", "") != dst:
+            return False
+        if port:
+            try:
+                p = int(port)
+            except ValueError:
+                return True
+            if p not in (r.get("sport"), r.get("dport")):
+                return False
+        return True
+    # pkt_feed is newest-first; return the requested window oldest-first so the
+    # client can append it in capture order.
+    out: List[dict] = []
+    for r in rows:
+        if since and int(r.get("seq") or 0) <= since:
+            break
+        if keep(r):
+            out.append(r)
+            if len(out) >= limit:
+                break
+    out.reverse()
+    return jsonify({"packets": out, "captured": len(rows),
+                    "mode": DETECT.status()["capture"]["mode"]})
+
+@app.route("/api/voip")
+def api_voip():
+    """VoIP packets actually captured, grouped by protocol.
+
+    Counts and rows come from the same bounded capture buffer the packet table
+    shows, so a protocol appears here only if a packet carrying it was seen.
+    Optional filters: ?ip= (either endpoint), ?limit= (newest rows returned).
+    """
+    ip = (request.args.get("ip") or "").strip()
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", "40"))))
+    except ValueError:
+        limit = 40
+    counts: Dict[str, int] = {}
+    recent: List[dict] = []
+    total = 0
+    with _lock:
+        rows = list(pkt_feed)
+    for r in rows:
+        v = r.get("voip") or ""
+        if not v:
+            continue
+        if ip and ip not in (r.get("src"), r.get("dst")):
+            continue
+        total += 1
+        counts[v] = counts.get(v, 0) + 1
+        if len(recent) < limit:
+            recent.append(r)
+    recent.reverse()                      # oldest-first, like /api/packets
+    return jsonify({"counts": counts, "total": total, "recent": recent,
+                    "mode": DETECT.status()["capture"]["mode"],
+                    "payload_available": bool(SCAPY_OK and IS_ROOT)})
+
+@app.route("/api/ports")
+def api_ports_all():
+    """Open ports for every device, with the service/version the scan found."""
+    rows = []
+    with _lock:
+        for ip, d in devices.items():
+            for p, info in (d.get("open_ports") or {}).items():
+                if not isinstance(info, dict) or info.get("state") != "open":
+                    continue
+                try:
+                    num = int(p)
+                except (TypeError, ValueError):
+                    continue
+                rows.append({"ip": ip, "hostname": d.get("hostname", ""),
+                             "vendor": d.get("vendor", ""),
+                             "device_type": d.get("device_type", ""),
+                             "status": d.get("status", "offline"),
+                             "port": num, "protocol": info.get("protocol", "tcp"),
+                             "service": service_label(num, info.get("service", "")),
+                             "version": info.get("version", "") or "",
+                             "risky": num in ADMIN_PORTS or num in DB_PORTS})
+    rows.sort(key=lambda r: (r["port"], r["ip"]))
+    return jsonify({"ports": rows, "count": len(rows),
+                    "devices": len({r["ip"] for r in rows})})
+
+@app.route("/api/vulnerabilities")
+def api_vulns_all():
+    """All findings for all devices.  These come from the port/service table in
+    assess_vulns(), not from an exploit check -- severity is the exposure the
+    port implies, and nothing here is reported for a closed port."""
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    rows, counts = [], {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    with _lock:
+        # A host is "scanned" once it has been assessed, including hosts that
+        # turned out to have no open ports -- counting only hosts with ports
+        # would understate coverage.
+        scanned = sum(1 for d in devices.values() if d.get("vuln_scanned"))
+        total   = len(devices)
+        for ip, d in devices.items():
+            for v in (d.get("vulnerabilities") or []):
+                sev = str(v.get("severity") or "LOW").upper()
+                counts[sev] = counts.get(sev, 0) + 1
+                rows.append({"ip": ip, "hostname": d.get("hostname", ""),
+                             "vendor": d.get("vendor", ""),
+                             "device_type": d.get("device_type", ""),
+                             "status": d.get("status", "offline"),
+                             "port": v.get("port", 0),
+                             "service": v.get("service", ""),
+                             "version": v.get("version", ""),
+                             "severity": sev,
+                             "description": v.get("description", "")})
+    rows.sort(key=lambda r: (order.get(r["severity"], 9), r["ip"], r["port"]))
+    return jsonify({"vulnerabilities": rows, "count": len(rows),
+                    "by_severity": counts, "devices_scanned": scanned,
+                    "devices_total": total})
+
+@app.route("/api/bandwidth")
+def api_bandwidth():
+    """Per-device recent throughput against the learned baseline, plus the
+    largest live flows.  All numbers are measured bytes; nothing is modelled."""
+    base = DETECT.bandwidth_baselines()
+    now  = time.time()
+    rows = []
+    with _lock:
+        for ip, d in devices.items():
+            samples = [s for s in traffic_data.get(ip, []) if isinstance(s, dict)][-60:]
+            out_60 = sum(int(s.get("out") or 0) for s in samples)
+            in_60  = sum(int(s.get("in") or 0) for s in samples)
+            b = base.get(ip) or {}
+            bl = int(b.get("baseline_out") or 0)
+            ratio = (out_60 / bl) if bl > 0 else 0.0
+            rows.append({"ip": ip, "hostname": d.get("hostname", ""),
+                         "vendor": d.get("vendor", ""),
+                         "role": DETECT._role(ip),
+                         "status": d.get("status", "offline"),
+                         "out_60": out_60, "in_60": in_60,
+                         "baseline_out": bl, "ratio": round(ratio, 2),
+                         "outlier": bool(bl and out_60 >= DET_BW_MIN_BYTES
+                                         and ratio >= DET_BW_FACTOR),
+                         "samples": int(b.get("samples") or 0)})
+    rows.sort(key=lambda r: r["out_60"], reverse=True)
+    return jsonify({"devices": rows, "flows": DETECT.top_flows(20),
+                    "window": 60, "generated": _ts()})
+
+@app.route("/api/detections")
+def api_detections():
+    """Detection coverage: which rules are running, which need telemetry this
+    process cannot see, and the counters for each."""
+    return jsonify(DETECT.status())
+
 @socketio.on("connect")
 def on_connect():
     with _lock:
@@ -2748,9 +5846,12 @@ def on_connect():
                 "first_seen": _ts(), "last_seen": _ts(),
                 "bytes_in": 0, "bytes_out": 0,
             })
+        detections = DETECT.status()
         emit("initial_state", {
             "devices": devlist,
             "alerts":  list(alerts)[:50],
+            "detections": detections,
+            "flows": DETECT.top_flows(20),
             "stats":   {
                 **net_stats,
                 "device_count": len(devices),
@@ -2768,7 +5869,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Netron v3 – Network Dashboard</title>
+<title>Netron – Network Dashboard</title>
+<link rel="icon" type="image/png" href="/assets/netron.png">
+<link rel="apple-touch-icon" href="/assets/netron.png">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -2788,6 +5891,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
 header{display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:52px;
   background:var(--bg2);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
 .logo{display:flex;align-items:center;gap:9px;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:17px;color:var(--accent)}
+.logo-img{width:26px;height:26px;object-fit:contain;display:block;flex:0 0 auto}
 .hdr-meta{display:flex;align-items:center;gap:16px;font-size:11px;color:var(--muted)}
 .live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
@@ -2893,9 +5997,39 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 .pkt-proto{min-width:46px;font-weight:700}
 .pkt-TCP{color:#64b5f6}.pkt-UDP{color:#81c784}.pkt-ICMP{color:#ffb74d}
 .pkt-ICMPv6{color:#4dd0e1}.pkt-ARP{color:#9e9e9e}.pkt-IPv6{color:#b0a8e0}
+/* VoIP protocols shown in the Protocol column (class = label without punctuation) */
+.pkt-SIP{color:#ffd740}.pkt-SIPTLS{color:#ffd740}.pkt-RTP{color:#ff9e40}
+.pkt-RTCP{color:#ffb74d}.pkt-H323{color:#ffcc80}.pkt-H323RAS{color:#ffcc80}
+.pkt-MGCP{color:#ffab91}.pkt-SCCP{color:#ff8a65}.pkt-STUN{color:#4dd0e1}.pkt-IAX2{color:#ce93d8}
 .pkt-RECV{color:#ce93d8}.pkt-SEND{color:#00e676}.pkt-OTHER{color:var(--muted)}
 .pkt-src{color:var(--accent)}.pkt-dst{color:#ce93d8}
 .pkt-info{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+
+/* WIRESHARK-STYLE PACKET TABLE */
+.ws-wrap{background:var(--bg3);border:1px solid var(--border);border-radius:9px;
+  height:420px;overflow:auto;font-family:'JetBrains Mono',monospace;font-size:11px}
+.ws-table{width:100%;border-collapse:collapse}
+.ws-table thead th{position:sticky;top:0;z-index:2;background:var(--bg2);color:var(--muted);
+  text-align:left;font-weight:600;font-size:10px;letter-spacing:.04em;padding:5px 8px;
+  border-bottom:1px solid var(--border);white-space:nowrap}
+.ws-table tbody td{padding:2px 8px;white-space:nowrap;border-bottom:1px solid rgba(26,37,53,.5)}
+.ws-table tbody tr:hover{background:var(--bg2)}
+.ws-no{color:var(--muted)}
+.ws-time{color:var(--muted)}
+.ws-src{color:var(--accent)}
+.ws-dst{color:#ce93d8}
+.ws-len{color:var(--muted);text-align:right}
+.ws-info{color:#8fa3b8;max-width:520px;overflow:hidden;text-overflow:ellipsis}
+.ws-table td.ws-info{white-space:nowrap}
+.filter-chip{font-size:10px;padding:3px 9px;border-radius:11px;border:1px solid var(--border);
+  background:var(--bg3);color:var(--muted);cursor:pointer;font-family:inherit}
+.filter-chip.on{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.08)}
+.meta-chip{font-size:9px;padding:1px 6px;border-radius:4px;background:var(--bg2);
+  border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.meta-chip.atk{border-color:rgba(124,77,255,.45);color:#b39ddb}
+.det-row{display:flex;gap:8px;align-items:center;padding:3px 0;font-size:10px;
+  border-bottom:1px solid rgba(26,37,53,.6)}
+.det-on{color:var(--green)}.det-off{color:var(--orange)}
 
 /* OS BADGE */
 .os-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 7px;border-radius:4px;
@@ -2919,6 +6053,19 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 @keyframes slIn{from{transform:translateX(110%);opacity:0}to{transform:none;opacity:1}}
 .toast-bar{width:4px;border-radius:2px;min-height:34px}
 
+
+/* ACTIVITY POPUP CONTROLS (moved out of <body> – <style> belongs in <head>) */
+.act-tb-btn{display:flex;flex-direction:column;align-items:center;padding:4px 10px;
+  border-radius:4px;cursor:pointer;color:#ccc;min-width:44px}
+.act-tb-btn:hover{background:rgba(0,229,255,.1)}
+.act-tb-btn:active{background:rgba(0,229,255,.2)}
+#act-proto-list::-webkit-scrollbar,#act-canvas::-webkit-scrollbar{width:6px}
+#act-proto-list::-webkit-scrollbar-track{background:transparent}
+#act-proto-list::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+/* Indeterminate progress bar – the server cannot stream real progress,
+   so the bar must not pretend to know a percentage. */
+#spd-progress.indeterminate{width:35%!important;transition:none;animation:spdIndet 1.1s linear infinite}
+@keyframes spdIndet{0%{margin-left:-35%}100%{margin-left:100%}}
 
 /* TOPOLOGY */
 #topo-canvas{background:var(--bg);image-rendering:crisp-edges;display:block}
@@ -2947,13 +6094,9 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 
 <header>
   <div class="logo">
-    <svg width="26" height="26" viewBox="0 0 26 26" fill="none">
-      <circle cx="13" cy="13" r="12" stroke="#00e5ff" stroke-width="1.4"/>
-      <circle cx="13" cy="13" r="4.5" fill="#00e5ff" opacity=".85"/>
-      <path d="M13 1v5M13 20v5M1 13h5M20 13h5" stroke="#00e5ff" stroke-width="1.4" stroke-linecap="round"/>
-      <circle cx="13" cy="13" r="8.5" stroke="#00e5ff" stroke-width=".4" stroke-dasharray="2 2.8"/>
-    </svg>
-    Netron <span style="font-size:10px;opacity:.5;margin-left:4px">v3</span>
+    <img class="logo-img" src="/assets/netron.png" alt="Netron logo"
+         width="26" height="26">
+    Netron
   </div>
   <div class="hdr-meta">
     <span id="hdr-net" class="mono">—</span>
@@ -3226,15 +6369,42 @@ tr:hover td{background:var(--bg3);cursor:pointer}
       <button id="pause-btn" class="btn" onclick="togglePause()">⏸ Pause</button>
     </div>
   </div>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:9px;font-size:10px">
-    <span style="color:var(--muted)">Legend:</span>
-    <span style="color:#64b5f6">■ TCP</span><span style="color:#81c784">■ UDP</span>
-    <span style="color:#ffb74d">■ ICMP</span><span style="color:#4dd0e1">■ ICMPv6</span>
-    <span style="color:#9e9e9e">■ ARP</span><span style="color:#ce93d8">■ RECV</span>
-    <span style="color:#00e676">■ SEND</span>
-    <span style="color:var(--muted);margin-left:auto" id="cap-note"></span>
+  <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:9px">
+    <span style="color:var(--muted);font-size:10px">Protocol:</span>
+    <button class="filter-chip on" data-proto="" onclick="setPktFilter(this,'')">All</button>
+    <button class="filter-chip" data-proto="TCP" onclick="setPktFilter(this,'TCP')">TCP</button>
+    <button class="filter-chip" data-proto="UDP" onclick="setPktFilter(this,'UDP')">UDP</button>
+    <button class="filter-chip" data-proto="ICMP" onclick="setPktFilter(this,'ICMP')">ICMP</button>
+    <button class="filter-chip" data-proto="ICMPv6" onclick="setPktFilter(this,'ICMPv6')">ICMPv6</button>
+    <button class="filter-chip" data-proto="ARP" onclick="setPktFilter(this,'ARP')">ARP</button>
+    <button class="filter-chip" data-proto="OTHER" onclick="setPktFilter(this,'OTHER')">Other</button>
+    <input class="search" id="pkt-search" placeholder="Filter address / info…"
+           oninput="renderPktRows()" style="max-width:230px">
+    <span style="margin-left:auto;font-size:10px;color:var(--muted)" id="cap-note"></span>
   </div>
-  <div class="pkt-stream" id="pkt-stream">
+  <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:9px">
+    <span style="color:var(--muted);font-size:10px">VoIP:</span>
+    <button class="filter-chip on" data-voip="" onclick="setVoipFilter(this,'')">All</button>
+    <button class="filter-chip" data-voip="SIP" onclick="setVoipFilter(this,'SIP')">SIP</button>
+    <button class="filter-chip" data-voip="RTP" onclick="setVoipFilter(this,'RTP')">RTP</button>
+    <button class="filter-chip" data-voip="RTCP" onclick="setVoipFilter(this,'RTCP')">RTCP</button>
+    <button class="filter-chip" data-voip="H.323" onclick="setVoipFilter(this,'H.323')">H.323</button>
+    <button class="filter-chip" data-voip="MGCP" onclick="setVoipFilter(this,'MGCP')">MGCP</button>
+    <button class="filter-chip" data-voip="SCCP" onclick="setVoipFilter(this,'SCCP')">SCCP</button>
+    <button class="filter-chip" data-voip="STUN" onclick="setVoipFilter(this,'STUN')">STUN</button>
+    <button class="filter-chip" data-voip="IAX2" onclick="setVoipFilter(this,'IAX2')">IAX2</button>
+    <span id="voip-summary" class="mono" style="margin-left:auto;font-size:10px;color:var(--muted)">
+      VoIP: watching…</span>
+  </div>
+  <div class="ws-wrap">
+    <table class="ws-table">
+      <thead><tr>
+        <th style="width:62px">No.</th><th style="width:88px">Time</th>
+        <th style="width:150px">Source</th><th style="width:150px">Destination</th>
+        <th style="width:74px">Protocol</th><th style="width:64px">Length</th><th>Info</th>
+      </tr></thead>
+      <tbody id="pkt-rows"></tbody>
+    </table>
     <div id="pkt-ph" style="color:var(--muted);padding:18px;text-align:center">⏳ Waiting for traffic…</div>
   </div>
 </div>
@@ -3242,26 +6412,53 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 <!-- ALERTS -->
 <div class="panel" id="panel-alerts">
   <div class="sec-hdr"><div class="sec-title">Security Alerts</div>
-    <button class="btn" onclick="ackAll()">✓ Acknowledge All</button></div>
+    <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+      <select id="alert-sev" class="search" onchange="renderAlerts()" style="width:130px">
+        <option value="">All severities</option>
+        <option value="CRITICAL">CRITICAL</option><option value="HIGH">HIGH</option>
+        <option value="MEDIUM">MEDIUM</option><option value="LOW">LOW</option>
+        <option value="INFO">INFO</option>
+      </select>
+      <input class="search" id="alert-search" placeholder="Filter host / rule / ATT&CK…"
+             oninput="renderAlerts()" style="max-width:220px">
+      <label style="font-size:10px;color:var(--muted);display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="alert-unacked" onchange="renderAlerts()"> unacked only</label>
+      <button class="btn" onclick="ackAll()">✓ Acknowledge All</button>
+    </div></div>
   <div class="alert-list" id="alert-list"></div>
+  <div style="margin-top:18px;border:1px solid var(--border);border-radius:8px;background:var(--bg3)">
+    <div class="sec-hdr" style="margin:0;padding:8px 10px;cursor:pointer" onclick="toggleDetCoverage()">
+      <div class="sec-title" style="font-size:12px;display:flex;align-items:center;gap:6px">
+        <span id="det-caret" style="display:inline-block;transition:transform .15s;color:var(--muted)">▸</span>
+        Detection coverage</div>
+      <span style="font-size:10px;color:var(--muted)" id="det-note"></span>
+    </div>
+    <div id="det-coverage" style="display:none;padding:0 10px 10px"></div>
+  </div>
 </div>
 
 <!-- VULNERABILITIES -->
 <div class="panel" id="panel-vulns">
-  <div class="sec-hdr"><div class="sec-title">Detected Vulnerabilities</div></div>
+  <div class="sec-hdr"><div class="sec-title">Detected Vulnerabilities</div>
+    <span style="font-size:10px;color:var(--muted)" id="vuln-stats"></span></div>
   <div id="vuln-list"></div>
 </div>
 
 <!-- OPEN PORTS -->
 <div class="panel" id="panel-ports">
   <div class="sec-hdr"><div class="sec-title">Open Ports</div>
-    <input class="search" id="port-search" placeholder="Filter port/service…" oninput="filterPorts()"></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span style="font-size:10px;color:var(--muted)" id="port-stats"></span>
+      <input class="search" id="port-search" placeholder="Filter port/service/host…" oninput="filterPorts()">
+    </div></div>
   <div id="ports-content"></div>
 </div>
 
 <!-- BANDWIDTH GRAPHS -->
 <div class="panel" id="panel-graphs">
-  <div class="sec-hdr"><div class="sec-title">Real-Time Bandwidth</div></div>
+  <div class="sec-hdr"><div class="sec-title">Real-Time Bandwidth</div>
+    <span style="font-size:10px;color:var(--muted)" id="bw-note"></span></div>
+  <div id="bw-summary"></div>
   <div id="graphs-content"></div>
 </div>
 
@@ -3313,15 +6510,6 @@ tr:hover td{background:var(--bg3);cursor:pointer}
              onmouseout="this.style.background='rgba(255,68,68,.1)'">✕</div>
       </div>
 
-      <!-- Menu bar -->
-      <div style="display:flex;gap:0;background:#22252a;border-bottom:1px solid #333;
-           padding:0 4px;font-size:11px">
-        <div class="act-menu-item">File</div>
-        <div class="act-menu-item">Capture</div>
-        <div class="act-menu-item">View</div>
-        <div class="act-menu-item">Help</div>
-      </div>
-
       <!-- Toolbar -->
       <div style="display:flex;align-items:center;gap:2px;background:#1e2128;
            padding:4px 8px;border-bottom:1px solid #333">
@@ -3334,10 +6522,6 @@ tr:hover td{background:var(--bg3);cursor:pointer}
         <div class="act-tb-btn" onclick="actToolbarAction('stop')" title="Stop">
           <div style="font-size:14px">⏹</div><div style="font-size:8px;color:#aaa">Stop</div></div>
         <div style="width:1px;height:24px;background:#444;margin:0 4px"></div>
-        <div class="act-tb-btn" onclick="actToolbarAction('pref')" title="Preferences">
-          <div style="font-size:14px">☰</div><div style="font-size:8px;color:#aaa">Pref.</div></div>
-        <div class="act-tb-btn" onclick="actToolbarAction('proto')" title="Protocols">
-          <div style="font-size:14px">≡</div><div style="font-size:8px;color:#aaa">Prot.</div></div>
         <div class="act-tb-btn" onclick="actToolbarAction('nodes')" title="Nodes">
           <div style="font-size:14px">◉</div><div style="font-size:8px;color:#aaa">Nodes</div></div>
         <div style="flex:1"></div>
@@ -3399,6 +6583,26 @@ tr:hover td{background:var(--bg3);cursor:pointer}
                display:none;z-index:10;transition:opacity .3s">
           </div>
         </div>
+
+        <!-- Right column: overview-style traffic graph + VoIP capture -->
+        <div style="width:310px;min-width:310px;background:#181b21;border-left:1px solid #333;
+             display:flex;flex-direction:column;gap:8px;overflow-y:auto;padding:8px;flex-shrink:0">
+          <div style="background:#14171c;border:1px solid #333;border-radius:6px;padding:8px">
+            <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">
+              Bandwidth – last 60s</div>
+            <canvas id="act-bw" height="90"></canvas>
+          </div>
+          <div style="background:#14171c;border:1px solid #333;border-radius:6px;padding:8px">
+            <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.5px;
+                 display:flex;justify-content:space-between;margin-bottom:6px">
+              <span>VoIP capture</span>
+              <span id="act-voip-total" class="mono" style="color:#ffd740">0 pkts</span></div>
+            <div id="act-voip-counts" class="mono" style="font-size:10px;color:#8a9;
+                 margin-bottom:6px;line-height:1.5">none captured yet</div>
+            <div id="act-voip-list" class="mono" style="font-size:9px;color:#9aa;
+                 max-height:170px;overflow-y:auto;line-height:1.5"></div>
+          </div>
+        </div>
       </div>
 
       <!-- Status bar -->
@@ -3411,17 +6615,6 @@ tr:hover td{background:var(--bg3);cursor:pointer}
     </div>
 </div>
 
-<style>
-  .act-menu-item{padding:4px 10px;color:#bbb;cursor:pointer;border-radius:3px;font-size:11px}
-  .act-menu-item:hover{background:rgba(0,229,255,.1);color:#fff}
-  .act-tb-btn{display:flex;flex-direction:column;align-items:center;padding:4px 10px;
-    border-radius:4px;cursor:pointer;color:#ccc;min-width:44px}
-  .act-tb-btn:hover{background:rgba(0,229,255,.1)}
-  .act-tb-btn:active{background:rgba(0,229,255,.2)}
-  #act-proto-list::-webkit-scrollbar,#act-canvas::-webkit-scrollbar{width:6px}
-  #act-proto-list::-webkit-scrollbar-track{background:transparent}
-  #act-proto-list::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
-</style>
 
 
 </main>
@@ -3448,8 +6641,12 @@ tr:hover td{background:var(--bg3);cursor:pointer}
 
 <script>
 const socket = io();
-const S = { devices:{}, alerts:[], stats:{} };
+const S = { devices:{}, alerts:[], stats:{}, ports:null, vulns:null, bw:null,
+            detections:null, flows:[] };
 let curModal = null, paused = false, pktTotal = 0, capMode = null;
+const PKT = { rows:[], filter:"", voip:"", topSeq:0 };
+const CACHE = { ports:0, vulns:0, bw:0, det:0 };
+let modalChart = null;
 let chTypes = null, chSev = null;
 const devCharts = {};
 
@@ -3476,11 +6673,24 @@ function esc(s){
 const _pendingDeviceUpdates = [];
 socket.on("initial_state", d => {
   d.devices.forEach(v => S.devices[v.ip] = v);
-  S.alerts = d.alerts;
-  Object.assign(S.stats, d.stats);
+  S.alerts = d.alerts || [];
+  Object.assign(S.stats, d.stats || {});
+  if (d.detections) { S.detections = d.detections; updateCapBadge(); }
+  if (Array.isArray(d.flows)) S.flows = d.flows;
   renderAll();
   if (_topoInited) TOPO.onInitialState(d);
   else _pendingInitial = d;  // store for when topo inits
+});
+socket.on("alert_update", u => {
+  const a = S.alerts.find(x => x.id === u.id);
+  if (!a) return;
+  a.count = u.count; a.last_ts = u.last_ts;
+  const node = document.getElementById("al-" + u.id);
+  if (node) {
+    const card = node.querySelector(".alert-title") && node;
+    if (active("alerts")) renderAlerts(); else if (card) { /* count refreshed on next paint */ }
+  }
+  if (active("overview")) renderOvAlerts();
 });
 let _pendingInitial = null;
 socket.on("device_update", d => {
@@ -3503,7 +6713,7 @@ socket.on("new_alert", a => {
   updateCounters();
 });
 socket.on("live_packet", p => {
-  if (!paused) addPkt(p);
+  if (!paused) ingestPacket(p);
   // Activities overlay buffers packets for its own graph
   if (ACT_STATE.currentIP && !ACT_STATE.paused &&
       (p.src === ACT_STATE.currentIP || p.dst === ACT_STATE.currentIP)) {
@@ -3513,8 +6723,18 @@ socket.on("live_packet", p => {
 });
 socket.on("topo_packet", p => { if (_topoInited) TOPO.onTopoPacket(p); });
 socket.on("traffic_update", d => {
-  el("s-pps", d.data ? Object.values(d.data).reduce((s,v)=>s+Math.round((v.in+v.out)/200),0) : 0);
   updateDevCharts(d);
+});
+socket.on("stats_update", s => {
+  Object.assign(S.stats, s || {});
+  updateCounters();
+});
+socket.on("device_removed", d => {
+  if (!d || !d.ip) return;
+  delete S.devices[d.ip];
+  if (typeof TOPO !== "undefined" && TOPO.removeNode) TOPO.removeNode(d.ip);
+  if (active("devices")) renderDevices();
+  updateCounters();
 });
 
 
@@ -3891,7 +7111,6 @@ const TOPO = (() => {
   function resize() {
     const wrap    = document.getElementById('topo-wrap');
     const toolbar = document.getElementById('topo-toolbar');
-    const panel   = document.getElementById('panel-overview');
     const dpr     = window.devicePixelRatio || 1;
     const w       = wrap.clientWidth || (window.innerWidth - 260);
     // Fit the topo panel (toolbar + canvas) within the left sidebar height,
@@ -3927,6 +7146,11 @@ const TOPO = (() => {
         delete nodes[ip];
       }
     });
+    // Drop edges that now reference a node that no longer exists, otherwise
+    // stale edges accumulate forever across devices churn.
+    Object.keys(edges).forEach(k => {
+      if (!nodes[edges[k].a] || !nodes[edges[k].b]) delete edges[k];
+    });
 
     lanNodes.forEach(d => {
       if (!nodes[d.ip]) {
@@ -3939,7 +7163,6 @@ const TOPO = (() => {
           pinned: d.is_gateway,
           phase: Math.random()*Math.PI*2,
           activity: 0,
-          pktQueue: 0,
         };
       }
       Object.assign(nodes[d.ip], d);
@@ -4337,13 +7560,20 @@ const TOPO = (() => {
   }
 
   // ── Tooltip ───────────────────────────────────────────────────────────────
-  let _tipNode=null;
+  let _tipNode=null, _tipSig=null;
   function showTip(ip, sx, sy){
     const tip=document.getElementById('topo-tip');
     if(!ip){hideTip();return;}
-    if(ip===_tipNode) { tip.style.left=(sx+16)+'px'; tip.style.top=(sy-10+52)+'px'; return; }
-    _tipNode=ip;
     const n=nodes[ip]; if(!n) return;
+    // The tooltip lives in #topo-wrap, but sx/sy are canvas-relative – offset by
+    // the toolbar height instead of the old hard-coded +52px guess.
+    const wrap=document.getElementById('topo-wrap');
+    const cv=document.getElementById('topo-canvas');
+    const off=(wrap&&cv)?Math.max(0,cv.getBoundingClientRect().top-wrap.getBoundingClientRect().top):0;
+    const place=()=>{ tip.style.left=(sx+16)+'px'; tip.style.top=(sy+off+12)+'px'; };
+    const sig=[n.ip,n.hostname,n.vendor,n.mac,n.os,n.status,n.vuln_count,n.bytes_in,n.bytes_out].join('|');
+    if(ip===_tipNode && sig===_tipSig){ place(); return; }
+    _tipNode=ip; _tipSig=sig;
     const col=nodeCol(n);
     const cat=category(n.device_type,n.is_gateway);
     const catLabel={'router':'Router/AP','phone':'Mobile Phone','tablet':'Tablet',
@@ -4352,20 +7582,20 @@ const TOPO = (() => {
       'vm':'Virtual Machine','iot':'IoT Device','speaker':'Smart Speaker',
       'watch':'Wearable','unknown':'Unknown'}[cat]||cat;
     tip.style.display='block';
-    tip.style.left=(sx+16)+'px'; tip.style.top=(sy-10+52)+'px';
+    place();
     tip.innerHTML=`
       <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:7px">
         <div style="width:10px;height:10px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col}"></div>
-        <span style="font-weight:700;color:${col};font-size:12px">${n.ip}</span>
+        <span style="font-weight:700;color:${col};font-size:12px">${esc(n.ip)}</span>
         ${n.is_gateway?'<span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 4px">GATEWAY</span>':''}
       </div>
       <div style="display:grid;grid-template-columns:90px 1fr;gap:3px 8px;font-size:10px;line-height:1.6">
         <span style="color:var(--muted)">Type</span><span style="font-weight:600">${catLabel}</span>
-        <span style="color:var(--muted)">Hostname</span><span>${n.hostname||'–'}</span>
-        <span style="color:var(--muted)">Vendor</span><span>${n.vendor||'Unknown'}</span>
-        <span style="color:var(--muted)">MAC</span><span style="font-family:'JetBrains Mono',monospace">${n.mac||'–'}</span>
-        <span style="color:var(--muted)">OS</span><span>${(n.os||'Unknown').substring(0,26)}</span>
-        <span style="color:var(--muted)">Status</span><span style="color:${n.status==='online'?'#00e676':'#3d5068'}">${n.status}</span>
+        <span style="color:var(--muted)">Hostname</span><span>${esc(n.hostname||'–')}</span>
+        <span style="color:var(--muted)">Vendor</span><span>${esc(n.vendor||'Unknown')}</span>
+        <span style="color:var(--muted)">MAC</span><span style="font-family:'JetBrains Mono',monospace">${esc(n.mac||'–')}</span>
+        <span style="color:var(--muted)">OS</span><span>${esc((n.os||'Unknown').substring(0,26))}</span>
+        <span style="color:var(--muted)">Status</span><span style="color:${n.status==='online'?'#00e676':'#3d5068'}">${esc(n.status)}</span>
         <span style="color:var(--muted)">Vulns</span><span style="color:${(n.vuln_count||0)>0?'#ff2d55':'#00e676'};font-weight:700">${n.vuln_count||0}</span>
         <span style="color:var(--muted)">↓ Traffic</span><span>${fmtB(n.bytes_in||0)}</span>
         <span style="color:var(--muted)">↑ Traffic</span><span>${fmtB(n.bytes_out||0)}</span>
@@ -4384,7 +7614,6 @@ const TOPO = (() => {
   function openTrace(ip){
     traceIP=ip; selIP=ip;
     const n=nodes[ip];
-    const cat=category(n?n.device_type:'', n?n.is_gateway:false);
     document.getElementById('trace-title').textContent=ip;
     document.getElementById('trace-info').textContent=
       [n&&n.hostname, n&&n.vendor, n&&n.os].filter(Boolean).join(' · ').substring(0,60);
@@ -4569,7 +7798,16 @@ const TOPO = (() => {
     return(b/1048576).toFixed(1)+'MB';
   }
 
-  return {init,onTopoPacket,onDeviceUpdate,onInitialState,
+  function removeNode(ip){
+    if(!ip || ip === gateway) return;
+    delete nodes[ip];
+    Object.keys(edges).forEach(k => {
+      if(edges[k].a === ip || edges[k].b === ip) delete edges[k];
+    });
+    updStats();
+  }
+
+  return {init,onTopoPacket,onDeviceUpdate,onInitialState,removeNode,
           togglePause,reset,zoomIn,zoomOut,fit,closeTrace,
           category,drawIcon,roundRect,hexToRgba,nodeCol,fmtB};
 })();
@@ -4601,6 +7839,7 @@ function ensureTopoInit(){
 function renderAll() {
   renderOverview(); renderDevices(); renderAlerts();
   renderVulns(); renderPorts(); renderGraphs(); updateCounters();
+  loadDetections(); renderPktRows();
 }
 
 function updateCounters() {
@@ -4610,6 +7849,7 @@ function updateCounters() {
   const ports  = devs.reduce((s,d)=>s+Object.keys(d.open_ports||{}).length,0);
   ["s-dev","ov-dev"].forEach(i=>el(i,devs.length));
   ["s-on","ov-on"].forEach(i=>el(i,online));
+  el("s-pps", S.stats.pps || 0);
   ["s-al","ov-al"].forEach(i=>el(i,S.stats.alert_count||0));
   el("ov-vu",vulns); el("ov-pt",ports); el("ov-sc",S.stats.scan_count||0);
   el("hdr-net",S.stats.network||""); el("hdr-gw","GW: "+(S.stats.gateway||""));
@@ -4733,40 +7973,148 @@ function renderDevices() {
 }
 function filterDevs(){renderDevices();}
 
-function renderAlerts(){
-  document.getElementById("alert-list").innerHTML=
-    S.alerts.map(alertHtml).join("")||"<div style='color:var(--muted);padding:16px'>No alerts yet.</div>";
-}
-
 function alertHtml(a){
   const c=sev2col(a.severity);
+  const chips=_enrichChips(a);
+  const count=(a.count||1)>1?`<span class="meta-chip" style="color:var(--yellow);border-color:var(--yellow)">×${a.count}</span>`:"";
+  const inc=a.incident?`<span class="meta-chip">incident ${esc(a.incident)}${a.correlated?" · correlated":""}</span>`:"";
   return `<div class="alert-card ${a.ack?'acked':''}" id="al-${esc(a.id)}">
     <div class="alert-bar" style="background:${c}"></div>
-    <div style="flex:1">
-      <div style="display:flex;align-items:center;gap:7px">
+    <div style="flex:1;min-width:0">
+      <div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
         <span class="badge-sev sev-${esc(a.severity)}">${esc(a.severity)}</span>
-        <span class="alert-title">${esc(a.title)}</span>
+        <span class="alert-title">${esc(a.title)}</span>${count}${inc}
       </div>
       <div class="alert-detail">${esc(a.detail)}</div>
-      <div class="alert-meta"><span class="ip">${esc(a.ip)}</span> · ${esc(a.ts)}</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px">${chips}</div>
+      ${a.attack?`<div class="alert-meta"><span class="meta-chip atk">${esc(a.attack)}</span></div>`:""}
+      ${a.action?`<div class="alert-meta">▸ ${esc(a.action)}</div>`:""}
+      <div class="alert-meta"><span class="ip">${esc(a.ip)}</span> · ${esc(a.last_ts||a.ts)}</div>
     </div>
     ${!a.ack?`<button class="ack-btn" onclick="ack('${esc(a.id)}',event)">✓ ACK</button>`
             :`<span style="font-size:9px;color:var(--muted)">ACKed</span>`}
   </div>`;
 }
 
-function renderVulns(){
+function _enrichChips(a){
+  const e=a.enrich||{}, out=[];
+  if(e.hostname) out.push(`<span class="meta-chip">${esc(e.hostname)}</span>`);
+  if(e.role)     out.push(`<span class="meta-chip">role: ${esc(e.role)}</span>`);
+  if(e.crit)     out.push(`<span class="meta-chip" style="color:${sev2col(e.crit)};border-color:${sev2col(e.crit)}">crit: ${esc(e.crit)}</span>`);
+  if(e.vlan && e.vlan!=="unknown") out.push(`<span class="meta-chip">VLAN ${esc(e.vlan)}</span>`);
+  if(e.vendor)   out.push(`<span class="meta-chip">${esc(e.vendor)}</span>`);
+  if(e.geo)      out.push(`<span class="meta-chip">${esc(e.geo)}</span>`);
+  if(e.ti)       out.push(`<span class="meta-chip" style="color:var(--red);border-color:var(--red)">${esc(e.ti)}</span>`);
+  if(e.owner)    out.push(`<span class="meta-chip">owner: ${esc(e.owner)}</span>`);
+  return out.join(" ");
+}
+
+function renderAlerts(){
+  const sev   = (document.getElementById("alert-sev")||{}).value || "";
+  const q     = (document.getElementById("alert-search")||{}).value || "";
+  const ql    = q.toLowerCase();
+  const unack = !!(document.getElementById("alert-unacked")||{}).checked;
+  const rows  = S.alerts.filter(a=>{
+    if(sev && a.severity!==sev) return false;
+    if(unack && a.ack) return false;
+    if(!ql) return true;
+    return JSON.stringify([a.ip,a.title,a.detail,a.attack,a.action,a.rule,a.incident])
+      .toLowerCase().includes(ql);
+  });
+  document.getElementById("alert-list").innerHTML=
+    rows.map(alertHtml).join("")||"<div style='color:var(--muted);padding:16px'>No alerts match.</div>";
+  renderDetectionCoverage();
+}
+
+// Detection coverage starts collapsed; the header is the toggle.
+function toggleDetCoverage(){
+  const box=document.getElementById("det-coverage");
+  if(!box) return;
+  const open=box.style.display!=="block";
+  box.style.display=open?"block":"none";
+  const c=document.getElementById("det-caret");
+  if(c) c.style.transform=open?"rotate(90deg)":"";
+}
+
+function loadDetections(force){
+  const now=Date.now();
+  if(!force && S.detections && now-CACHE.det<15000) return;
+  CACHE.det=now;
+  fetch("/api/detections").then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{S.detections=d; updateCapBadge(); renderDetectionCoverage();})
+    .catch(()=>{});
+}
+
+function renderDetectionCoverage(){
+  const box=document.getElementById("det-coverage");
+  if(!box) return;
+  const d=S.detections;
+  if(!d){ box.innerHTML="<div style='color:var(--muted);font-size:11px'>Loading detection status…</div>"; return; }
+  const cap=d.capture||{}, al=d.authlog||{};
+  const head=`<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:10px;margin-bottom:8px">
+    <span class="meta-chip" style="color:${cap.network_wide?'var(--green)':'var(--orange)'};border-color:currentColor">
+      ${cap.network_wide?'capture: scapy (network-wide)':'capture: psutil (this host only)'}</span>
+    <span class="meta-chip" style="color:${al.active?'var(--green)':'var(--orange)'};border-color:currentColor">
+      auth log: ${esc(al.active?al.path:al.reason||'inactive')}</span>
+    <span class="meta-chip">tor exits: ${esc((d.tor||{}).status||'?')}</span>
+    <span class="meta-chip">TI list: ${esc((d.ti||{}).status||'?')}</span>
+    <span class="meta-chip">geolocation: ${(d.geo||{}).enabled?'on':'off'}</span>
+    <span class="meta-chip">new-domain: ${esc((d.rdap||{}).status||'?')}</span>
+  </div>`;
+  const active=(d.rules||[]).filter(r=>r.active), inactive=(d.rules||[]).filter(r=>!r.active);
+  const line=r=>`<div class="det-row">
+      <span class="${r.active?'det-on':'det-off'}">${r.active?'●':'○'}</span>
+      <span style="flex:1;color:var(--text)">${esc(r.title)}</span>
+      <span class="meta-chip atk" style="font-size:8px">${esc(r.attack.split(' ')[0])}</span>
+      <span style="font-size:9px;color:var(--muted);min-width:70px;text-align:right">${r.hits?r.hits+' hits':'0 hits'}</span>
+      <span style="font-size:9px;color:${r.active?'var(--muted)':'var(--orange)'};max-width:340px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.reason||'')}">${esc(r.reason||'')}</span>
+    </div>`;
+  el("det-note", `${active.length} active / ${(d.rules||[]).length} rules · ${inactive.length} need telemetry this process cannot read`);
+  box.innerHTML=head+
+    `<div style="font-size:10px;color:var(--muted);margin:6px 0 2px">Active (${active.length})</div>`+
+    active.map(line).join("")+
+    (inactive.length?`<div style="font-size:10px;color:var(--muted);margin:8px 0 2px">Inactive (${inactive.length}) — not counted as coverage</div>`+inactive.map(line).join(""):"");
+}
+
+function _vulnRows(){
+  if(S.vulns && Array.isArray(S.vulns.vulnerabilities)) return S.vulns.vulnerabilities;
   const rows=[];
   Object.values(S.devices).forEach(d=>(d.vulnerabilities||[]).forEach(v=>rows.push({ip:d.ip,...v})));
-  rows.sort((a,b)=>({CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3,INFO:4}[a.severity]||9)-({CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3,INFO:4}[b.severity]||9));
+  return rows;
+}
+
+function renderVulns(){
+  paintVulns();
+  const now=Date.now();
+  if(now-CACHE.vulns < 4000) return;
+  CACHE.vulns=now;
+  fetch("/api/vulnerabilities").then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{S.vulns=d; paintVulns();})
+    .catch(()=>{});
+}
+
+function paintVulns(){
+  const rows=_vulnRows().slice()
+    .sort((a,b)=>({CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3,INFO:4}[a.severity]||9)-
+                 ({CRITICAL:0,HIGH:1,MEDIUM:2,LOW:3,INFO:4}[b.severity]||9));
+  const counts={CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
+  rows.forEach(v=>{if(counts[v.severity]!==undefined)counts[v.severity]++;});
+  const scanned=(S.vulns&&S.vulns.devices_scanned)||Object.values(S.devices).filter(d=>d.vuln_scanned).length;
+  const total=(S.vulns&&S.vulns.devices_total)||Object.keys(S.devices).length;
+  el("vuln-stats", `${rows.length} finding(s) on ${new Set(rows.map(r=>r.ip)).size} device(s)`+
+     ` · ${scanned}/${total} device(s) scanned · `+
+     Object.keys(counts).filter(k=>counts[k]).map(k=>`${k} ${counts[k]}`).join(" · "));
   document.getElementById("vuln-list").innerHTML=rows.length?rows.map(v=>`
     <div class="alert-card" style="margin-bottom:7px">
       <div class="alert-bar" style="background:${sev2col(v.severity)}"></div>
-      <div style="flex:1">
+      <div style="flex:1;min-width:0">
         <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
           <span class="badge-sev sev-${esc(v.severity)}">${esc(v.severity)}</span>
           <strong>${esc(v.service)}</strong>
           ${v.port?`<span class="mono" style="color:var(--accent2);font-size:11px">:${v.port}</span>`:""}
+          ${v.hostname?`<span class="meta-chip">${esc(v.hostname)}</span>`:""}
+          ${v.device_type?`<span class="meta-chip">${esc(v.device_type)}</span>`:""}
+          ${v.status && v.status!=="online"?`<span class="meta-chip" style="color:var(--muted)">${esc(v.status)}</span>`:""}
           <span class="ip" style="font-size:11px;margin-left:auto">${esc(v.ip)}</span>
         </div>
         <div class="alert-detail">${esc(v.description)}</div>
@@ -4776,36 +8124,151 @@ function renderVulns(){
     :"<div style='color:var(--muted);padding:16px'>No vulnerabilities detected yet.</div>";
 }
 
-function renderPorts(){
-  const q=(document.getElementById("port-search").value||"").toLowerCase();
-  let html="";
+// ── Open ports (all devices) ──────────────────────────────────────────────
+function _portRows(){
+  if(S.ports && Array.isArray(S.ports.ports)) return S.ports.ports;
+  const rows=[];
   Object.values(S.devices).forEach(d=>{
-    const pts=Object.entries(d.open_ports||{})
-      .filter(([p,i])=>i.state==="open"&&(!q||p.toString().includes(q)||i.service.toLowerCase().includes(q)));
+    Object.entries(d.open_ports||{}).forEach(([p,i])=>{
+      if(i.state!=="open") return;
+      rows.push({ip:d.ip, hostname:d.hostname||"", vendor:d.vendor||"",
+                 device_type:d.device_type||"", status:d.status||"",
+                 port:parseInt(p,10), protocol:i.protocol||"tcp",
+                 service:i.service||"", version:i.version||"",
+                 risky: !!VPMAP[parseInt(p,10)]});
+    });
+  });
+  return rows;
+}
+
+function renderPorts(){
+  paintPorts();
+  const now=Date.now();
+  if(now-CACHE.ports < 4000) return;
+  CACHE.ports=now;
+  fetch("/api/ports").then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{S.ports=d; paintPorts();})
+    .catch(()=>{});
+}
+
+function paintPorts(){
+  const q=((document.getElementById("port-search")||{}).value||"").toLowerCase();
+  const byIp={};
+  _portRows().forEach(r=>{(byIp[r.ip]=byIp[r.ip]||{...r,ports:[]}).ports.push(r);});
+  const ips=Object.keys(byIp).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+  let shown=0, html="";
+  ips.forEach(ip=>{
+    const g=byIp[ip];
+    const pts=g.ports.filter(r=>!q||
+      String(r.port).includes(q) ||
+      (r.service||"").toLowerCase().includes(q) ||
+      (r.version||"").toLowerCase().includes(q) ||
+      ip.includes(q) || (g.hostname||"").toLowerCase().includes(q));
     if(!pts.length) return;
+    shown+=pts.length;
+    const dev=S.devices[ip]||{};
     html+=`<div style="margin-bottom:18px">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-        <span class="ip">${d.ip}</span>
-        <span style="color:var(--muted);font-size:10px">${esc(d.vendor||"")} – ${esc(d.device_type||"")}</span>
-        <span class="os-badge" style="margin-left:auto">${(()=>{const r=resolveOsDisplay(d.os,d.ttl);return (r.icon?r.icon+" ":"")+r.text;})()}</span>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+        <span class="ip">${esc(ip)}</span>
+        ${g.hostname?`<span class="meta-chip">${esc(g.hostname)}</span>`:""}
+        <span style="color:var(--muted);font-size:10px">${esc(g.vendor||"unknown vendor")} – ${esc(g.device_type||"unknown type")}</span>
+        <span class="meta-chip">${pts.length} open</span>
+        <span class="os-badge" style="margin-left:auto">${(()=>{const r=resolveOsDisplay(dev.os,dev.ttl);return (r.icon?r.icon+" ":"")+r.text;})()}</span>
       </div>
       <div class="port-grid">
-        ${pts.map(([p,i])=>{
-          const vp=VPMAP[parseInt(p)];
+        ${pts.sort((a,b)=>a.port-b.port).map(r=>{
+          const vp=VPMAP[r.port];
           const s=vp?vp[1]:"LOW";
           return `<div class="port-card">
-            <div class="port-num">${p}</div>
-            <div><div class="port-svc">${esc(i.service||"unknown")} <span class="badge-sev sev-${s}" style="font-size:8px">${s}</span></div>
-            <div class="port-ver">${esc(i.version||i.protocol||"")}</div></div></div>`;
+            <div class="port-num">${r.port}</div>
+            <div style="min-width:0">
+              <div class="port-svc">${esc(r.service||"unknown")}
+                <span class="badge-sev sev-${s}" style="font-size:8px">${s}</span>
+                <span class="meta-chip" style="font-size:8px">${esc(r.protocol||"")}</span></div>
+              <div class="port-ver">${esc(r.version||"version not identified")}</div></div></div>`;
         }).join("")}
       </div></div>`;
   });
-  document.getElementById("ports-content").innerHTML=html||"<div style='color:var(--muted);padding:16px'>Scanning…</div>";
+  const total=_portRows().length;
+  el("port-stats", `${shown}/${total} port entries · ${new Set(_portRows().map(r=>r.ip)).size} device(s)`);
+  document.getElementById("ports-content").innerHTML=html||
+    (total?"<div style='color:var(--muted);padding:16px'>No ports match the filter.</div>"
+          :"<div style='color:var(--muted);padding:16px'>Scanning…</div>");
 }
 function filterPorts(){renderPorts();}
 
-// ── Bandwidth graphs ──────────────────────────────────────────────────────
+// ── Bandwidth ─────────────────────────────────────────────────────────────
 function renderGraphs(){
+  paintGraphs();
+  const now=Date.now();
+  if(now-CACHE.bw < 4000) return;
+  CACHE.bw=now;
+  fetch("/api/bandwidth").then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{S.bw=d; S.flows=d.flows||[]; paintBwSummary();})
+    .catch(()=>{});
+}
+
+function paintBwSummary(){
+  const box=document.getElementById("bw-summary");
+  if(!box) return;
+  const d=S.bw;
+  if(!d){ box.innerHTML="<div style='color:var(--muted);font-size:11px'>Measuring…</div>"; return; }
+  const devs=(d.devices||[]).filter(x=>x.out_60||x.in_60);
+  const flows=d.flows||[];
+  const totOut=devs.reduce((s,x)=>s+(x.out_60||0),0);
+  const totIn =devs.reduce((s,x)=>s+(x.in_60||0),0);
+  const outliers=(d.devices||[]).filter(x=>x.outlier);
+  el("bw-note", `window ${d.window||60}s · ${devs.length} device(s) with traffic · baselines need a few minutes of samples`);
+  const stat=(lbl,val,col)=>`<div class="chart-card" style="margin:0">
+      <div class="chart-lbl">${lbl}</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:${col}">${val}</div></div>`;
+  let html=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px">
+    ${stat("Outbound / 60s", fmt(totOut), "#7c4dff")}
+    ${stat("Inbound / 60s",  fmt(totIn),  "var(--accent)")}
+    ${stat("Above baseline", outliers.length, outliers.length?"var(--red)":"var(--green)")}
+    ${stat("Largest upload", flows.length?fmt(Math.max(...flows.map(f=>f.bytes_out||0))):"–", "var(--yellow)")}
+  </div>`;
+  if(outliers.length){
+    html+=`<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">
+      Above learned baseline</div>`+outliers.map(o=>`
+      <div class="alert-card" style="margin-bottom:7px">
+        <div class="alert-bar" style="background:var(--high)"></div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap">
+            <span class="badge-sev sev-HIGH">OUTLIER</span>
+            <span class="ip">${esc(o.ip)}</span>
+            ${o.hostname?`<span class="meta-chip">${esc(o.hostname)}</span>`:""}
+            <span class="meta-chip">role: ${esc(o.role)}</span>
+            <span style="font-size:11px;margin-left:auto;color:var(--high)">
+              ${fmt(o.out_60)} / 60s · ${o.ratio}× baseline</span>
+          </div>
+          <div class="alert-detail">learned baseline ${fmt(o.baseline_out)} / 60s
+            (${o.samples} sample(s)) ${o.vendor?"· "+esc(o.vendor):""}</div>
+        </div></div>`).join("");
+  }
+  if(flows.length){
+    html+=`<div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:14px 0 6px">
+      Largest live flows</div>
+      <div class="ws-wrap" style="height:auto;max-height:320px">
+      <table class="ws-table"><thead><tr>
+        <th>Source</th><th>Destination</th><th>Proto</th><th style="text-align:right">Out</th>
+        <th style="text-align:right">In</th><th style="text-align:right">Pkts</th><th>Session</th></tr></thead><tbody>`+
+      flows.map(f=>`<tr>
+        <td class="ws-src">${esc(f.src)}</td>
+        <td class="ws-dst">${esc(f.dst)}:${f.dport}${f.domain?` <span class="meta-chip">${esc(f.domain)}</span>`:""}</td>
+        <td class="pkt-${esc(f.proto)}">${esc(f.proto)}</td>
+        <td class="ws-len">${fmt(f.bytes_out||0)}</td>
+        <td class="ws-len">${fmt(f.bytes_in||0)}</td>
+        <td class="ws-len">${f.packets||0}</td>
+        <td class="ws-time">${f.first&&f.last?Math.max(0,Math.round(f.last-f.first))+"s":"–"}</td>
+      </tr>`).join("")+`</tbody></table></div>`;
+  } else {
+    html+=`<div style='color:var(--muted);font-size:11px;padding:10px'>No flows recorded yet.</div>`;
+  }
+  box.innerHTML=html;
+}
+
+function paintGraphs(){
   const c=document.getElementById("graphs-content");
   if(!c) return;
   Object.values(S.devices).filter(d=>d.status==="online").forEach(d=>{
@@ -4855,56 +8318,155 @@ function updateDevCharts(upd){
     if(ch.data.labels.length>60){ch.data.labels.shift();ch.data.datasets.forEach(ds=>ds.data.shift());}
     ch.update("none");
   });
-}
-
-// ── Packet stream ─────────────────────────────────────────────────────────
-let _lastPsutilPkt = 0;   // last RECV/SEND (psutil NIC poller) timestamp
-function addPkt(p){
-  pktTotal++;
-  // Truthful capture-mode badge: RECV/SEND events come only from the psutil
-  // NIC poller, so while they're recent we're in psutil mode. Transport-level
-  // packets (TCP/UDP/ICMP/ICMPv6/ARP) mean deep capture ONLY if no psutil
-  // poll has been seen recently (the no-root fallback also synthesises
-  // TCP/UDP events from the socket table).
-  if(["RECV","SEND"].includes(p.proto)) _lastPsutilPkt = Date.now();
-  if(["TCP","UDP","ICMP","ICMPv6","ARP"].includes(p.proto))
-    capMode = (Date.now() - _lastPsutilPkt < 5000) ? "psutil" : "scapy";
-  const ph=document.getElementById("pkt-ph");
-  if(ph) ph.remove();
-  el("pkt-ctr", pktTotal.toLocaleString()+" pkts");
-  if(pktTotal%30===1){
-    const b=document.getElementById("cap-badge");
-    if(b){
-      if(capMode==="scapy"){
-        b.textContent="🔴 Scapy full capture (root)";b.style.color="var(--green)";
-        const note=document.getElementById("cap-note");
-        if(note) note.textContent="IPv4 · IPv6 · ARP — TCP, UDP, ICMP, ICMPv6 + others";
-      } else {
-        b.textContent="🟡 psutil — TCP/UDP only (run as root for full capture)";b.style.color="var(--yellow)";
-        const note=document.getElementById("cap-note");
-        if(note) note.textContent="psutil socket poll: TCP/UDP only";
+  // The activities popup graphs the same series for the device it has open.
+  if (typeof ACT_STATE !== "undefined" && actBwChart && ACT_STATE.currentIP) {
+    const bw = (upd.data||{})[ACT_STATE.currentIP];
+    if (bw) {
+      actBwChart.data.labels.push(upd.ts);
+      actBwChart.data.datasets[0].data.push(bw.in);
+      actBwChart.data.datasets[1].data.push(bw.out);
+      if (actBwChart.data.labels.length > 60) {
+        actBwChart.data.labels.shift();
+        actBwChart.data.datasets.forEach(ds => ds.data.shift());
       }
+      actBwChart.update("none");
     }
   }
-  const s=document.getElementById("pkt-stream");
-  const d=document.createElement("div");
-  d.className="pkt";
-  d.innerHTML=`<span class="pkt-ts">${esc(p.ts)}</span>`+
-    `<span class="pkt-proto pkt-${esc(p.proto)}">${esc(p.proto)}</span>`+
-    `<span class="pkt-src">${esc(p.src)}</span>`+
-    `<span style="color:var(--muted)">→</span>`+
-    `<span class="pkt-dst">${esc(p.dst)}</span>`+
-    `<span class="pkt-info">${esc(p.info||"")}</span>`+
-    `<span style="color:var(--muted);margin-left:auto;white-space:nowrap">${fmt(p.len)}</span>`;
-  s.insertBefore(d, s.firstChild);
-  if(s.children.length>500) s.removeChild(s.lastChild);
 }
+
+// ── Packet table (Wireshark-style) ────────────────────────────────────────
+function updateCapBadge(){
+  const b=document.getElementById("cap-badge"), note=document.getElementById("cap-note");
+  if(!b) return;
+  const cap=S.detections && S.detections.capture;
+  if(cap){
+    if(cap.network_wide){
+      b.textContent="🔴 Network-wide capture (root)";b.style.color="var(--green)";
+      if(note) note.textContent="every TCP / UDP / ICMP / ARP frame on the interface";
+    } else {
+      b.textContent="🟡 This host only — run as root for network-wide";
+      b.style.color="var(--yellow)";
+      if(note) note.textContent=cap.reason||"";
+    }
+    return;
+  }
+  if(capMode==="scapy"){
+    b.textContent="🔴 Full capture (root)";b.style.color="var(--green)";
+  } else {
+    b.textContent="🟡 This host only (run as root for full capture)";b.style.color="var(--yellow)";
+  }
+}
+
+function _pktMatch(p){
+  if(PKT.filter && p.proto!==PKT.filter) return false;
+  // VoIP filter: "SIP" also selects "SIP/TLS" and "H.323" selects "H.323 RAS".
+  if(PKT.voip && !String(p.voip||"").startsWith(PKT.voip)) return false;
+  const q=((document.getElementById("pkt-search")||{}).value||"").toLowerCase();
+  if(!q) return true;
+  return (p.src||"").toLowerCase().includes(q) ||
+         (p.dst||"").toLowerCase().includes(q) ||
+         (p.info||"").toLowerCase().includes(q) ||
+         String(p.len||"").includes(q);
+}
+
+function _pktHtml(p){
+  const t=(p.ts||"").length>=19 ? p.ts.substring(11) : (p.ts||"");
+  return `<tr>
+    <td class="ws-no">${p.seq||""}</td>
+    <td class="ws-time">${esc(t)}</td>
+    <td class="ws-src">${esc(p.src||"")}</td>
+    <td class="ws-dst">${esc(p.dst||"")}</td>
+    <td class="pkt-${esc(String(p.voip||p.proto||"OTHER").replace(/[^A-Za-z0-9]/g,""))}" style="font-weight:700"
+        title="${p.voip?esc(p.voip+" over "+(p.proto||"")):esc(p.proto||"")}">${esc(p.voip||p.proto||"")}</td>
+    <td class="ws-len">${p.len||0}</td>
+    <td class="ws-info" title="${esc(p.info||"")}">${esc(p.info||"")}</td>
+  </tr>`;
+}
+
+function ingestPacket(p){
+  if(p && p.seq){
+    if(p.seq <= PKT.topSeq) return;      // socket event already seen in a poll
+    PKT.topSeq = p.seq;
+  }
+  pktTotal++;
+  PKT.rows.push(p);
+  if(PKT.rows.length>2000) PKT.rows.shift();
+  if(!paused && _pktMatch(p)){
+    const body=document.getElementById("pkt-rows");
+    if(body){
+      const ph=document.getElementById("pkt-ph");
+      if(ph) ph.remove();
+      body.insertAdjacentHTML("afterbegin", _pktHtml(p));
+      while(body.children.length>800) body.removeChild(body.lastChild);
+    }
+  }
+  el("pkt-ctr", pktTotal.toLocaleString()+" pkts");
+  if(pktTotal%50===1) updateCapBadge();
+}
+
+function renderPktRows(){
+  const body=document.getElementById("pkt-rows");
+  if(!body) return;
+  const rows=PKT.rows.filter(_pktMatch).slice(-800).reverse();
+  body.innerHTML=rows.map(_pktHtml).join("");
+  if(!rows.length){
+    body.innerHTML=`<tr><td colspan="7" style="color:var(--muted);padding:18px;text-align:center">
+      ${PKT.rows.length?"No packets match the filter.":"Waiting for traffic…"}</td></tr>`;
+  }
+}
+
+function setVoipFilter(btn,voip){
+  PKT.voip=voip||"";
+  document.querySelectorAll(".filter-chip[data-voip]").forEach(b=>b.classList.remove("on"));
+  if(btn) btn.classList.add("on");
+  renderPktRows();
+}
+
+function pollVoip(){
+  if(!active("traffic")) return;
+  fetch("/api/voip?limit=1").then(r=>r.ok?r.json():Promise.reject(r.status)).then(d=>{
+    const e=document.getElementById("voip-summary");
+    if(!e) return;
+    const parts=Object.entries(d.counts||{});
+    // Nothing is listed until a VoIP packet has actually been captured; the
+    // capture mode is named so an empty list is never mistaken for "no VoIP".
+    e.textContent = parts.length
+      ? "VoIP " + d.total + " pkts: " + parts.map(([k,v])=>k+" "+v).join(" · ")
+      : (d.payload_available
+          ? "VoIP: none captured yet"
+          : "VoIP: none captured yet (RTP needs payload — run as root)");
+  }).catch(()=>{});
+}
+setInterval(pollVoip, 5000);
+
+function setPktFilter(btn,proto){
+  PKT.filter=proto;
+  document.querySelectorAll(".filter-chip[data-proto]").forEach(b=>b.classList.remove("on"));
+  if(btn) btn.classList.add("on");
+  renderPktRows();
+}
+
+function pollPackets(){
+  if(paused || !active("traffic")) return;
+  fetch(`/api/packets?limit=600&since=${PKT.topSeq}`)
+    .then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{(d.packets||[]).forEach(ingestPacket);})
+    .catch(()=>{});
+}
+setInterval(pollPackets, 3000);
+
 function clearPkts(){
-  document.getElementById("pkt-stream").innerHTML=
-    '<div id="pkt-ph" style="color:var(--muted);padding:18px;text-align:center">Cleared — waiting…</div>';
+  PKT.rows=[];
+  const body=document.getElementById("pkt-rows");
+  if(body) body.innerHTML=`<tr><td colspan="7" style="color:var(--muted);padding:18px;text-align:center">
+    Cleared — waiting…</td></tr>`;
   pktTotal=0; el("pkt-ctr","0 pkts");
 }
-function togglePause(){paused=!paused;document.getElementById("pause-btn").textContent=paused?"▶ Resume":"⏸ Pause";}
+function togglePause(){
+  paused=!paused;
+  document.getElementById("pause-btn").textContent=paused?"▶ Resume":"⏸ Pause";
+  if(!paused) renderPktRows();
+}
 
 // ── Modal ─────────────────────────────────────────────────────────────────
 function openModal(ip){
@@ -4953,7 +8515,10 @@ function openModal(ip){
     </div>`;
   fetch(`/api/traffic/${ip}`).then(r=>r.json()).then(td=>{
     try{
-      new Chart(document.getElementById("modal-bw"),{
+      // Chart.js throws "Canvas is already in use" if the previous instance is
+      // not destroyed before re-creating one on the same canvas.
+      if (modalChart) { modalChart.destroy(); modalChart = null; }
+      modalChart = new Chart(document.getElementById("modal-bw"),{
         type:"line",
         data:{labels:td.map(t=>t.ts),datasets:[
           {label:"In",  data:td.map(t=>t.in),  borderColor:"#00e5ff",backgroundColor:"rgba(0,229,255,.08)",tension:.4,fill:true,pointRadius:0,borderWidth:1.5},
@@ -4967,11 +8532,16 @@ function openModal(ip){
     }catch(e){}
   });
 }
-function closeModal(){document.getElementById("modal-overlay").classList.remove("open");curModal=null;}
+function closeModal(){
+  document.getElementById("modal-overlay").classList.remove("open");
+  curModal=null;
+  if(modalChart){modalChart.destroy();modalChart=null;}
+}
 function rescan(){
   if(!curModal) return;
   authFetch(`/api/rescan/${curModal}`, {method:"POST"}).then(r=>r.json())
-    .then(d=>toast({title:"Rescan Queued",detail:d.message||"",severity:"INFO"}));
+    .then(d=>toast({title:"Rescan Queued",detail:d.message||"",severity:"INFO"}))
+    .catch(err=>toast({title:"Rescan Failed",detail:String(err&&err.message||err),severity:"HIGH"}));
 }
 document.getElementById("modal-overlay").addEventListener("click",function(e){if(e.target===this)closeModal();});
 
@@ -5015,20 +8585,188 @@ function nav(el,name){
   if(name==="graphs"){renderGraphs();}
   if(name==="ports"){renderPorts();}
   if(name==="vulns"){renderVulns();}
+  if(name==="traffic"){pollPackets(); pollVoip(); updateCapBadge();}
+  if(name==="alerts"){renderAlerts(); loadDetections(true);}
   if(name==="activities"){actInit();}
 }
 
 // ── INTERNET SPEED TEST ──────────────────────────────────────────────────────
-let _spdTimer = null;
-let _spdProgress = 0;
+// The measurement runs in a background thread on the server (it has to move
+// tens of MB, 10–25 s), so the page starts it and then polls for the phase,
+// the progress and the live numbers instead of blocking on one request.
+let _spdPoll = null;
+let _spdPollFails = 0;
+
+const SPD_PHASES = {
+  starting:        "⏳ Starting…",
+  latency:         "📡 Measuring latency & jitter…",
+  "speedtest-cli": "🌐 speedtest-cli: measuring download & upload…",
+  download:        "⬇ Measuring download speed…",
+  upload:          "⬆ Measuring upload speed…",
+  done:            "✓ Complete",
+  error:           "❌ Failed",
+};
+
+function updateSpeedProgress(st) {
+  const pwrap = document.getElementById("spd-progress-wrap");
+  const pbar  = document.getElementById("spd-progress");
+  const phase = document.getElementById("spd-phase");
+  if (pwrap) pwrap.style.display = "block";
+  if (pbar) {
+    pbar.classList.remove("indeterminate");
+    pbar.style.width = Math.min(100, Math.max(0, st.progress || 0)) + "%";
+  }
+  if (phase) phase.textContent = SPD_PHASES[st.phase] || "⏳ Testing…";
+  // live values as they are measured (muted until the run finishes)
+  const live = { "spd-down": st.download_mbps, "spd-up": st.upload_mbps,
+                 "spd-lat": st.latency_ms, "spd-jit": st.jitter_ms };
+  for (const [id, v] of Object.entries(live)) {
+    if (!v) continue;
+    const e = document.getElementById(id);
+    if (e) { e.textContent = Number(v).toFixed(1); e.style.color = "var(--muted)"; }
+  }
+}
+
+function speedTestFailed(err) {
+  clearTimeout(_spdPoll); _spdPoll = null;
+  const pbar  = document.getElementById("spd-progress");
+  const pwrap = document.getElementById("spd-progress-wrap");
+  const btn   = document.getElementById("speed-btn");
+  if (pbar)  { pbar.classList.remove("indeterminate"); pbar.style.width = "0%"; }
+  if (pwrap) pwrap.style.display = "block";
+  el("spd-phase", "❌ " + (err && err.message ? err.message : "test failed"));
+  if (btn) { btn.disabled = false; btn.textContent = "▶ Run Test"; }
+  el("spd-status", "Error");
+  el("spd-emoji",  "❌");
+  const statusEl = document.getElementById("spd-status");
+  if (statusEl) statusEl.style.color = "var(--red)";
+  const engineEl = document.getElementById("spd-engine");
+  if (engineEl) { engineEl.textContent = "failed"; engineEl.style.color = "var(--red)"; }
+  console.error("Speed test error:", err);
+}
+
+function pollSpeedState() {
+  clearTimeout(_spdPoll);
+  authFetch("/api/speedtest").then(r => r.json()).then(st => {
+    _spdPollFails = 0;
+    updateSpeedProgress(st);
+    if (st.running) {
+      const now = Date.now() / 1000;
+      if (st.last_update && now - st.last_update > 70) {
+        speedTestFailed(new Error("the measurement stalled"));
+        return;
+      }
+      _spdPoll = setTimeout(pollSpeedState, 500); return;
+    }
+    if (st.error) { speedTestFailed(new Error(st.error)); return; }
+    const d = st.result || {};
+    if (!d.status || d.status === "error" ||
+        (!(d.download_mbps) && !(d.upload_mbps) && !(d.latency_ms))) {
+      speedTestFailed(new Error("no measurement succeeded"));
+      return;
+    }
+    renderSpeedResult(d);
+  }).catch(() => {
+    // a single dropped poll must not abort a running measurement
+    if (++_spdPollFails > 20) { speedTestFailed(new Error("lost contact with the server")); return; }
+    _spdPoll = setTimeout(pollSpeedState, 1000);
+  });
+}
+
+function renderSpeedResult(d) {
+  clearTimeout(_spdPoll); _spdPoll = null;
+  const pbar  = document.getElementById("spd-progress");
+  const pwrap = document.getElementById("spd-progress-wrap");
+  const btn   = document.getElementById("speed-btn");
+  if (pbar)  { pbar.classList.remove("indeterminate"); pbar.style.width = "100%"; }
+  el("spd-phase", "✓ Complete");
+  setTimeout(() => { if (pwrap) pwrap.style.display = "none"; }, 1200);
+  if (btn) { btn.disabled = false; btn.textContent = "↺ Run Again"; }
+
+  const dl  = d.download_mbps || 0;
+  const up  = d.upload_mbps   || 0;
+  const lat = d.latency_ms    || 0;
+  const jit = d.jitter_ms     || 0;
+
+  // ── Download ──
+  const dlCol = dl > 50 ? "var(--green)" : dl > 10 ? "var(--accent)" : "var(--orange)";
+  el("spd-down", dl.toFixed(1));
+  document.getElementById("spd-down").style.color = dlCol;
+  document.getElementById("spd-down-bar").style.width = Math.min(100, (dl / 100) * 100) + "%";
+
+  // ── Upload ──
+  const upCol = up > 20 ? "var(--green)" : up > 5 ? "#7c4dff" : "var(--orange)";
+  el("spd-up", up.toFixed(1));
+  document.getElementById("spd-up").style.color = upCol;
+  document.getElementById("spd-up-bar").style.width = Math.min(100, (up / 50) * 100) + "%";
+
+  // ── Ping ──
+  const latCol = lat < 30 ? "var(--green)" : lat < 80 ? "var(--yellow)" : "var(--red)";
+  el("spd-lat", lat.toFixed(1));
+  document.getElementById("spd-lat").style.color = latCol;
+  // Ping bar: lower = better (invert: 200ms = 0 bar, 0ms = full bar)
+  document.getElementById("spd-lat-bar").style.width = Math.min(100, Math.max(0, 100 - (lat / 200) * 100)) + "%";
+
+  // ── Jitter ──
+  const jitCol = jit < 10 ? "var(--green)" : jit < 30 ? "var(--yellow)" : "var(--red)";
+  el("spd-jit", jit.toFixed(1));
+  document.getElementById("spd-jit").style.color = jitCol;
+  document.getElementById("spd-jit-bar").style.width = Math.min(100, Math.max(0, 100 - (jit / 50) * 100)) + "%";
+
+  // ── Quality rating ──
+  let quality, emoji, bars, qCol;
+  if (dl > 50 && up > 20 && lat < 30) {
+    quality = "Excellent"; emoji = "🚀"; bars = 5; qCol = "var(--green)";
+  } else if (dl > 20 && up > 5 && lat < 60) {
+    quality = "Good";      emoji = "✅"; bars = 4; qCol = "var(--green)";
+  } else if (dl > 5 && lat < 120) {
+    quality = "Fair";      emoji = "⚡"; bars = 3; qCol = "var(--yellow)";
+  } else if (dl > 1) {
+    quality = "Slow";      emoji = "🐢"; bars = 2; qCol = "var(--orange)";
+  } else {
+    quality = "Poor";      emoji = "❌"; bars = 1; qCol = "var(--red)";
+  }
+  el("spd-status", quality);
+  el("spd-emoji",  emoji);
+  const statusEl2 = document.getElementById("spd-status");
+  if (statusEl2) statusEl2.style.color = qCol;
+
+  // Signal strength bars
+  const barsEl = document.getElementById("spd-bars");
+  if (barsEl) {
+    const heights = [16, 20, 24, 28, 32];
+    barsEl.innerHTML = heights.map((h,i) =>
+      `<span style="width:5px;height:${h}px;border-radius:2px;display:inline-block;
+       background:${i < bars ? qCol : "var(--border)"}"></span>`
+    ).join("");
+  }
+
+  // Engine badge — which method produced these numbers
+  const isCli = (d.status||"").includes("speedtest-cli");
+  const isProbe = isCli || (d.status||"").includes("HTTP probe");
+  const engine = isCli ? "speedtest-cli ✓" :
+                 isProbe ? "HTTP probe ✓" : d.status || "unknown";
+  const engineEl = document.getElementById("spd-engine");
+  if (engineEl) {
+    engineEl.textContent = engine;
+    const eCol = isCli ? "var(--green)" : isProbe ? "var(--accent)" : "var(--yellow)";
+    engineEl.style.color = eCol;
+    engineEl.style.borderColor = isCli ? "rgba(0,230,118,.3)" :
+                                 isProbe ? "rgba(0,229,255,.3)" : "rgba(255,215,64,.3)";
+    if (d.method) engineEl.title = d.method;
+  }
+  if (d.server) el("spd-server", "📍 " + d.server);
+  if (d.isp)    el("spd-isp",    "🌐 " + d.isp);
+  el("spd-ts", new Date().toLocaleTimeString());
+}
 
 function runSpeedTest() {
   const btn = document.getElementById("speed-btn");
   if (btn.disabled) return;  // already running
-
-  // Reset UI
   btn.disabled = true;
   btn.textContent = "⏳ Testing…";
+
+  // Reset UI
   ["spd-down","spd-up","spd-lat","spd-jit"].forEach(id => {
     const e = document.getElementById(id);
     if (e) { e.textContent = "—"; e.style.color = "var(--muted)"; }
@@ -5042,130 +8780,26 @@ function runSpeedTest() {
   const statusEl = document.getElementById("spd-status");
   if (statusEl) statusEl.style.color = "var(--yellow)";
 
-  // Show progress bar
   const pwrap = document.getElementById("spd-progress-wrap");
   const pbar  = document.getElementById("spd-progress");
-  const phase = document.getElementById("spd-phase");
   if (pwrap) pwrap.style.display = "block";
+  if (pbar)  { pbar.classList.remove("indeterminate"); pbar.style.width = "0%"; }
+  el("spd-phase", SPD_PHASES.starting);
 
-  // Animated progress (fake, since we can't stream from server)
-  _spdProgress = 0;
-  const phases = [
-    [8,  "🔍 Starting speed test…"],
-    [22, "📡 Measuring latency…"],
-    [42, "⬇ Downloading test data…"],
-    [70, "⬆ Uploading test data…"],
-    [92, "📊 Computing results…"],
-  ];
-  let phaseIdx = 0;
-  if (_spdTimer) clearInterval(_spdTimer);
-  _spdTimer = setInterval(() => {
-    if (_spdProgress < 94) {
-      _spdProgress = Math.min(94, _spdProgress + 0.8);
-      if (pbar) pbar.style.width = _spdProgress + "%";
-      // Update phase label
-      const nextPhase = phases.find(([pct]) => _spdProgress < pct);
-      if (nextPhase && phase) phase.textContent = nextPhase[1];
-    }
-  }, 200);
-
-  // Fire the actual test
-  fetch("/api/speedtest").then(r => r.json()).then(d => {
-    clearInterval(_spdTimer);
-    if (pbar)  pbar.style.width  = "100%";
-    if (phase) phase.textContent = "✓ Complete";
-    setTimeout(() => { if (pwrap) pwrap.style.display = "none"; }, 1200);
-
-    btn.disabled = false; btn.textContent = "↺ Run Again";
-
-    const dl  = d.download_mbps || 0;
-    const up  = d.upload_mbps   || 0;
-    const lat = d.latency_ms    || 0;
-    const jit = d.jitter_ms     || 0;
-
-    // ── Download ──
-    const dlCol = dl > 50 ? "var(--green)" : dl > 10 ? "var(--accent)" : "var(--orange)";
-    el("spd-down", dl.toFixed(1));
-    document.getElementById("spd-down").style.color = dlCol;
-    document.getElementById("spd-down-bar").style.width = Math.min(100, (dl / 100) * 100) + "%";
-
-    // ── Upload ──
-    const upCol = up > 20 ? "var(--green)" : up > 5 ? "#7c4dff" : "var(--orange)";
-    el("spd-up", up.toFixed(1));
-    document.getElementById("spd-up").style.color = upCol;
-    document.getElementById("spd-up-bar").style.width = Math.min(100, (up / 50) * 100) + "%";
-
-    // ── Ping ──
-    const latCol = lat < 30 ? "var(--green)" : lat < 80 ? "var(--yellow)" : "var(--red)";
-    el("spd-lat", lat.toFixed(1));
-    document.getElementById("spd-lat").style.color = latCol;
-    // Ping bar: lower = better (invert: 200ms = 0 bar, 0ms = full bar)
-    document.getElementById("spd-lat-bar").style.width = Math.min(100, Math.max(0, 100 - (lat / 200) * 100)) + "%";
-
-    // ── Jitter ──
-    const jitCol = jit < 10 ? "var(--green)" : jit < 30 ? "var(--yellow)" : "var(--red)";
-    el("spd-jit", jit.toFixed(1));
-    document.getElementById("spd-jit").style.color = jitCol;
-    document.getElementById("spd-jit-bar").style.width = Math.min(100, Math.max(0, 100 - (jit / 50) * 100)) + "%";
-
-    // ── Quality rating ──
-    let quality, emoji, bars, qCol;
-    if (dl > 50 && up > 20 && lat < 30) {
-      quality = "Excellent"; emoji = "🚀"; bars = 5; qCol = "var(--green)";
-    } else if (dl > 20 && up > 5 && lat < 60) {
-      quality = "Good";      emoji = "✅"; bars = 4; qCol = "var(--green)";
-    } else if (dl > 5 && lat < 120) {
-      quality = "Fair";      emoji = "⚡"; bars = 3; qCol = "var(--yellow)";
-    } else if (dl > 1) {
-      quality = "Slow";      emoji = "🐢"; bars = 2; qCol = "var(--orange)";
-    } else {
-      quality = "Poor";      emoji = "❌"; bars = 1; qCol = "var(--red)";
-    }
-    el("spd-status", quality);
-    el("spd-emoji",  emoji);
-    const statusEl2 = document.getElementById("spd-status");
-    if (statusEl2) statusEl2.style.color = qCol;
-
-    // Signal strength bars
-    const barsEl = document.getElementById("spd-bars");
-    if (barsEl) {
-      const heights = [16, 20, 24, 28, 32];
-      barsEl.innerHTML = heights.map((h,i) =>
-        `<span style="width:5px;height:${h}px;border-radius:2px;display:inline-block;
-         background:${i < bars ? qCol : "var(--border)"}"></span>`
-      ).join("");
-    }
-
-    // Meta info
-    // Engine badge — show which measurement method was used
-    const isCli = (d.status||"").includes("speedtest-cli");
-    const isProbe = isCli || (d.status||"").includes("HTTP probe");
-    const engine = isCli ? "speedtest-cli ✓" :
-                   isProbe ? "HTTP probe ✓" : d.status || "unknown";
-    const engineEl = document.getElementById("spd-engine");
-    if (engineEl) {
-      engineEl.textContent = engine;
-      const eCol = isCli ? "var(--green)" : isProbe ? "var(--accent)" : "var(--yellow)";
-      engineEl.style.color = eCol;
-      engineEl.style.borderColor = isCli ? "rgba(0,230,118,.3)" :
-                                   isProbe ? "rgba(0,229,255,.3)" : "rgba(255,215,64,.3)";
-    }
-    if (d.server) el("spd-server", "📍 " + d.server);
-    if (d.isp)    el("spd-isp",    "🌐 " + d.isp);
-    el("spd-ts", new Date().toLocaleTimeString());
-
-  }).catch(err => {
-    clearInterval(_spdTimer);
-    if (pwrap) pwrap.style.display = "none";
-    btn.disabled = false; btn.textContent = "▶ Run Test";
-    el("spd-status", "Error");
-    el("spd-emoji",  "❌");
-    const statusEl3 = document.getElementById("spd-status");
-    if (statusEl3) statusEl3.style.color = "var(--red)";
-    const engineEl2 = document.getElementById("spd-engine");
-    if (engineEl2) { engineEl2.textContent = "failed"; engineEl2.style.color = "var(--red)"; }
-    console.error("Speed test error:", err);
-  });
+  // POST starts the worker thread and returns immediately (202 + state).
+  _spdPollFails = 0;
+  authFetch("/api/speedtest?force=1", {method:"POST"})
+    .then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok && r.status !== 202) throw new Error(d.error || ("HTTP " + r.status));
+      if (d.error) throw new Error(d.error);
+      return d;
+    })
+    .then(st => {
+      updateSpeedProgress(st);
+      pollSpeedState();
+    })
+    .catch(err => speedTestFailed(err));
 }
 
 // ── BLOCK / UNBLOCK DEVICE ───────────────────────────────────────────────────
@@ -5174,12 +8808,18 @@ function blockDevice(ip, e){
   const d = S.devices[ip];
   const isBlocked = d && d.blocked;
   const url = isBlocked ? `/api/unblock/${ip}` : `/api/block/${ip}`;
-  authFetch(url, {method:"POST"}).then(r=>r.json()).then(res=>{
+  authFetch(url, {method:"POST"}).then(async r=>{
+    const res = await r.json().catch(()=>({}));
+    if(!r.ok || res.ok === false){
+      toast({title: isBlocked?"Unblock Failed":"Block Failed",
+             detail: res.error || res.message || ("HTTP "+r.status), severity:"HIGH"});
+      return;          // never flip local state on a failed block
+    }
     toast({title: isBlocked?"Device Unblocked":"Device Blocked",
            detail: res.message||"", severity: isBlocked?"INFO":"HIGH"});
     if(S.devices[ip]) S.devices[ip].blocked = !isBlocked;
     if(active("devices")) renderDevices();
-  });
+  }).catch(err=>toast({title:"Request Failed",detail:String(err&&err.message||err),severity:"HIGH"}));
 }
 function active(name){return document.getElementById("panel-"+name)?.classList.contains("active");}
 
@@ -5204,6 +8844,9 @@ function dtIcon(t){
     "PlayStation":"🎮","Xbox":"🎮","Nintendo Switch":"🎮","Gaming Console":"🎮",
     "Wearable":"⌚","Smart Speaker":"🔊","Network Switch":"🔗",
     "Windows Server":"🖧","Server":"🖧","IP Camera":"📷","Streaming Device":"📡",
+    "Windows PC (RDP)":"🖥","NAS / Server":"🖧","Apple Device":"🍎",
+    "Chromecast":"📡","Echo":"🔊","FireTV":"📺","Google Home":"🏠",
+    "Pixel Phone":"📱","Smart Home":"🏠",
   };
   if (!t || t.toLowerCase()==="unknown") return "";
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(t.trim())) return "";
@@ -5284,6 +8927,7 @@ const ACT_STATE = {
   _dragStartY: 0,
   _panStartX: 0,
   _panStartY: 0,
+  voip: { counts:{}, total:0, recent:[] },
 };
 
 // Protocol colors (user-specified)
@@ -5396,6 +9040,12 @@ function actLoadPopup(ip) {
   _actUpdateZoomLabel();
   _actBindCanvasEvents();
 
+  // Overview-style traffic graph + VoIP capture for this device
+  ACT_STATE.voip = { counts:{}, total:0, recent:[] };
+  _actRenderVoip();
+  _actInitBwChart(ip);
+  _actSeedVoip(ip);
+
   fetch(`/api/activities/${ip}`).then(r=>r.json()).then(data => {
     ACT_STATE.data = data;
     _actBuildGraph(data);
@@ -5410,9 +9060,86 @@ function actLoadPopup(ip) {
   });
 }
 
+// ── Overview-style bandwidth graph for this device ────────────────────────
+// Same Chart.js line chart the dashboard's overview charts are built with, and
+// the same datasets/colours/options as the per-device bandwidth graphs, fed by
+// /api/traffic (history) and traffic_update (live).
+let actBwChart = null;
+function _actInitBwChart(ip) {
+  const cv = document.getElementById('act-bw');
+  if (!cv) return;
+  if (actBwChart) { actBwChart.destroy(); actBwChart = null; }
+  actBwChart = new Chart(cv, {
+    type:"line",
+    data:{labels:[],datasets:[
+      {label:"In",  data:[],borderColor:"#00e5ff",backgroundColor:"rgba(0,229,255,.07)",tension:.4,fill:true,pointRadius:0,borderWidth:1.5},
+      {label:"Out", data:[],borderColor:"#7c4dff",backgroundColor:"rgba(124,77,255,.07)",tension:.4,fill:true,pointRadius:0,borderWidth:1.5},
+    ]},
+    options:{animation:false,
+      plugins:{legend:{labels:{color:"#8899aa",font:{size:9}}}},
+      scales:{x:{ticks:{color:"#3d5068",maxTicksLimit:6},grid:{color:"#1a2535"}},
+              y:{ticks:{color:"#3d5068"},grid:{color:"#1a2535"}}}}
+  });
+  fetch(`/api/traffic/${ip}`).then(r=>r.json()).then(td=>{
+    if (!actBwChart) return;
+    // Last 60 samples, matching the window the live feed keeps.
+    const win = td.slice(-60);
+    actBwChart.data.labels = win.map(t=>t.ts);
+    actBwChart.data.datasets[0].data = win.map(t=>t.in);
+    actBwChart.data.datasets[1].data = win.map(t=>t.out);
+    actBwChart.update("none");
+  }).catch(()=>{});
+}
+
+// ── VoIP capture for this device ──────────────────────────────────────────
+function _actVoipPkt(p) {
+  const v = ACT_STATE.voip;
+  if (!v || !p.voip) return;
+  v.counts[p.voip] = (v.counts[p.voip]||0) + 1;
+  v.total++;
+  v.recent.push(p);
+  if (v.recent.length > 40) v.recent.shift();
+  _actRenderVoip();
+}
+function _actSeedVoip(ip) {
+  fetch(`/api/voip?ip=${encodeURIComponent(ip)}&limit=40`).then(r=>r.ok?r.json():Promise.reject(r.status))
+    .then(d=>{
+      if (!ACT_STATE.voip || ACT_STATE.currentIP !== ip) return;
+      // History is seeded first; live packets keep incrementing the same counters.
+      ACT_STATE.voip.counts = Object.assign({}, d.counts||{}, {});
+      ACT_STATE.voip.total  = d.total||0;
+      ACT_STATE.voip.recent = (d.recent||[]).slice(-40);
+      ACT_STATE.voip.payload_available = d.payload_available;
+      _actRenderVoip();
+    }).catch(()=>{});
+}
+function _actRenderVoip() {
+  const v = ACT_STATE.voip;
+  const tot = document.getElementById('act-voip-total');
+  const box = document.getElementById('act-voip-counts');
+  const lst = document.getElementById('act-voip-list');
+  if (!v || !tot || !box || !lst) return;
+  tot.textContent = v.total + ' pkts';
+  const parts = Object.entries(v.counts||{}).sort((a,b)=>b[1]-a[1]);
+  box.innerHTML = parts.length
+    ? parts.map(([k,n])=>`<div style="display:flex;justify-content:space-between">
+        <span style="color:#ffd740">${esc(k)}</span><span>${n}</span></div>`).join('')
+    : '<span style="color:#666">none captured yet</span>';
+  lst.innerHTML = (v.recent||[]).slice(-10).reverse().map(p=>{
+    const t = (p.ts||'').length>=19 ? p.ts.substring(11,19) : (p.ts||'');
+    return `<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+      <span style="color:#666">${esc(t)}</span>
+      <span style="color:#ffd740">${esc(p.voip||'')}</span>
+      ${esc((p.src||'').split('.').pop())}→${esc((p.dst||'').split('.').pop())}
+      <span style="color:#666">${p.sport||''}→${p.dport||''}</span></div>`;
+  }).join('');
+}
+
 // ── Close popup ──────────────────────────────────────────────────────────
 function actClosePopup() {
   document.getElementById('act-overlay').style.display = 'none';
+  if (actBwChart) { actBwChart.destroy(); actBwChart = null; }
+  ACT_STATE.voip = { counts:{}, total:0, recent:[] };
   _actStopLoop();
   ACT_STATE.currentIP = null;
   ACT_STATE.data = null;
@@ -5452,8 +9179,10 @@ function _actFlushPackets() {
   if (!buf.length) return;
   const batch = buf.splice(0, 50);
   batch.forEach(pkt => _actIngestPacket(pkt));
-  _actRenderProtoSidebar(ACT_STATE.data);
-  _actUpdateCanvasInfo();
+  if (ACT_STATE.data) {
+    _actRenderProtoSidebar(ACT_STATE.data);
+    _actUpdateCanvasInfo();
+  }
   if (ACT_STATE.data) {
     const sum = ACT_STATE.data.summary || {};
     _actSetStatus(`Live — ${sum.total_requests||0} packets · ${sum.unique_destinations||0} hosts`);
@@ -5466,6 +9195,9 @@ function _actIngestPacket(pkt) {
   if (!ip) return;
   if (pkt.src !== ip && pkt.dst !== ip) return;
   const proto = (pkt.proto||'OTHER').toUpperCase();
+  // VoIP is counted whether or not a graph protocol filter is active: the VoIP
+  // panel reports captured packets, not the filtered view.
+  _actVoipPkt(pkt);
   if (ACT_STATE.protoFilter && proto !== ACT_STATE.protoFilter) return;
 
   const data = ACT_STATE.data;
@@ -5758,19 +9490,6 @@ function _actNodeIconCat(n, dev, kind) {
   return 'unknown';
 }
 
-// Convert a node's world position to screen coordinates
-function _actNodeToScreen(nx, ny) {
-  const canvas = document.getElementById('act-canvas');
-  const container = canvas.parentElement;
-  const W = container.clientWidth, H = container.clientHeight;
-  const z = ACT_STATE.zoom, px = ACT_STATE.panX, py = ACT_STATE.panY;
-  const wx = nx * W, wy = ny * H;
-  return {
-    x: W/2 + px*z + (wx - W/2) * z,
-    y: H/2 + py*z + (wy - H/2) * z,
-  };
-}
-
 // Convert a screen position to world node coords (nx, ny in [0,1]-ish)
 function _actScreenToNode(sx, sy) {
   const canvas = document.getElementById('act-canvas');
@@ -5814,6 +9533,8 @@ function _actOnHoverMove(e) {
 
 let _actTipNode = null;
 function _actShowTip(id, sx, sy, stay) {
+  // Every device-controlled field below is escaped: values come from reverse
+  // DNS, HTTP banners and vendor APIs and must never reach innerHTML raw.
   const tip = document.getElementById('act-tip');
   if (!tip) return;
   const dev = _actNodeDev(id);
@@ -5838,17 +9559,17 @@ function _actShowTip(id, sx, sy, stay) {
   tip.innerHTML = `
     <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:7px">
       <div style="width:10px;height:10px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col}"></div>
-      <span style="font-weight:700;color:${col};font-size:12px;font-family:'JetBrains Mono',monospace">${title}</span>
+      <span style="font-weight:700;color:${col};font-size:12px;font-family:'JetBrains Mono',monospace">${esc(title)}</span>
       ${(dev && dev.is_gateway)?'<span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 4px">GATEWAY</span>':''}
     </div>
     <div style="display:grid;grid-template-columns:90px 1fr;gap:3px 8px;font-size:10px;line-height:1.6">
-      <span style="color:var(--muted)">Type</span><span style="font-weight:600">${catLabel}</span>
-      <span style="color:var(--muted)">Address</span><span style="font-family:'JetBrains Mono',monospace">${id}</span>
-      <span style="color:var(--muted)">Domain</span><span>${(kind==='internet' && n && n.host) || (dev && dev.hostname) || '–'}</span>
-      <span style="color:var(--muted)">Vendor</span><span>${dev && dev.vendor || 'Unknown'}</span>
-      <span style="color:var(--muted)">MAC</span><span style="font-family:'JetBrains Mono',monospace">${dev && dev.mac || '–'}</span>
-      <span style="color:var(--muted)">OS</span><span>${((dev && dev.os)||'Unknown').substring(0,26)}</span>
-      <span style="color:var(--muted)">Status</span><span style="color:${(dev&&dev.status)==='online'?'#00e676':'#3d5068'}">${dev && dev.status || '–'}</span>
+      <span style="color:var(--muted)">Type</span><span style="font-weight:600">${esc(catLabel)}</span>
+      <span style="color:var(--muted)">Address</span><span style="font-family:'JetBrains Mono',monospace">${esc(id)}</span>
+      <span style="color:var(--muted)">Domain</span><span>${esc((kind==='internet' && n && n.host) || (dev && dev.hostname) || '–')}</span>
+      <span style="color:var(--muted)">Vendor</span><span>${esc((dev && dev.vendor) || 'Unknown')}</span>
+      <span style="color:var(--muted)">MAC</span><span style="font-family:'JetBrains Mono',monospace">${esc((dev && dev.mac) || '–')}</span>
+      <span style="color:var(--muted)">OS</span><span>${esc(((dev && dev.os)||'Unknown').substring(0,26))}</span>
+      <span style="color:var(--muted)">Status</span><span style="color:${(dev&&dev.status)==='online'?'#00e676':'#3d5068'}">${esc((dev && dev.status) || '–')}</span>
       <span style="color:var(--muted)">Vulns</span><span style="color:${(dev&&(dev.vuln_count||0))>0?'#ff2d55':'#00e676'};font-weight:700">${dev && dev.vuln_count || 0}</span>
       <span style="color:var(--muted)">↓ Traffic</span><span>${TOPO && TOPO.fmtB ? TOPO.fmtB(dev && dev.bytes_in || 0) : (dev ? dev.bytes_in||0 : 0)}</span>
       <span style="color:var(--muted)">↑ Traffic</span><span>${TOPO && TOPO.fmtB ? TOPO.fmtB(dev && dev.bytes_out || 0) : (dev ? dev.bytes_out||0 : 0)}</span>
@@ -5873,11 +9594,15 @@ function _actBuildGraph(data) {
 
   sites.forEach((s, i) => {
     if (s.ip === ip) return;
+    // DNS-only entries have no resolved IP (the packet log cannot see the
+    // answer) – key them by domain so they never collide on an empty string.
+    const sid = s.ip || (s.domain ? 'dns:' + s.domain : '');
+    if (!sid) return;
     const angle = (i / Math.max(1, sites.length)) * Math.PI * 2;
     const radius = 0.28 + Math.random() * 0.08;
     const host = _actIsDomain(s.domain) ? s.domain : null;
-    nodeMap[s.ip] = {
-      id: s.ip, label: s.domain || s.ip, host,
+    nodeMap[sid] = {
+      id: sid, label: s.domain || s.ip, host,
       x: 0.5 + Math.cos(angle) * radius, y: 0.5 + Math.sin(angle) * radius,
       size: Math.max(5, Math.min(14, 4 + Math.sqrt(s.count) * 2)),
       color: _actColor(s.proto || 'OTHER'), isLocal: false, traffic: s.count,
@@ -5936,7 +9661,7 @@ function _actRenderProtoSidebar(data) {
     const col = _actColor(proto);
     const bytes = protoBytes[proto]||0;
     const isActive = filter === proto;
-    return `<div onclick="actFilterProto('${proto}')" style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;border-radius:3px;transition:background .15s;
+    return `<div data-proto="${esc(proto)}" onclick="actFilterProto(this.dataset.proto)" style="display:flex;align-items:center;gap:8px;padding:5px 8px;cursor:pointer;border-radius:3px;transition:background .15s;
       background:${isActive?'rgba(0,229,255,.12)':'transparent'};border:1px solid ${isActive?col+'44':'transparent'}"
       onmouseover="this.style.background='rgba(255,255,255,.05)'" onmouseout="this.style.background='${isActive?'rgba(0,229,255,.12)':'transparent'}'">
       <div style="width:10px;height:10px;border-radius:50%;background:${col};box-shadow:0 0 6px ${col}55;flex-shrink:0"></div>
@@ -5959,18 +9684,23 @@ function actFilterProto(proto) {
 
 // ── Canvas drawing ───────────────────────────────────────────────────────
 let _actCanvasReady = false;
-let _actFrameCount = 0;
 function _actDrawCanvas() {
   const canvas = document.getElementById('act-canvas');
   if (!canvas) return;
   const container = canvas.parentElement;
   const W = container.clientWidth;
   const H = container.clientHeight;
-  canvas.width = W;
-  canvas.height = H;
+  // Size the backing store to the device pixel ratio once, not on every
+  // animation frame (that reallocated and cleared the canvas 60×/s).
+  const dpr = window.devicePixelRatio || 1;
+  const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
   const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   _actCanvasReady = true;
-  _actFrameCount++;
 
   const zoom = ACT_STATE.zoom;
   const panX = ACT_STATE.panX;
@@ -6157,8 +9887,8 @@ function _actUpdateCanvasInfo() {
   const fHosts = new Set(); fEdges.forEach(e=>{fHosts.add(e.src);fHosts.add(e.dst)});
   el.style.display = 'block';
   el.innerHTML = `
-    <div style="margin-bottom:4px;font-weight:600;color:#fff">${ACT_STATE.data.ip}</div>
-    ${filter?`<div style="margin-bottom:4px;color:var(--accent);font-size:9px">Filtered: ${filter}</div>`:''}
+    <div style="margin-bottom:4px;font-weight:600;color:#fff">${esc(ACT_STATE.data.ip)}</div>
+    ${filter?`<div style="margin-bottom:4px;color:var(--accent);font-size:9px">Filtered: ${esc(filter)}</div>`:''}
     <div>Packets: <span style="color:#00e5ff">${fPkts}</span></div>
     <div>Bytes: <span style="color:#00e676">${_fmtAct(fBytes)}</span></div>
     <div>Hosts: <span style="color:#ff6b35">${fHosts.size}</span></div>
@@ -6201,10 +9931,25 @@ function actInit() {
 // Clock
 setInterval(()=>{const e=document.getElementById("hdr-time");if(e)e.textContent=new Date().toLocaleTimeString();},1000);
 
-// Init topology graph on load (overview is default active)
 </script>
 </body>
 </html>"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STATIC ASSETS  (logo + favicon)
+# ─────────────────────────────────────────────────────────────────────────────
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+@app.route("/assets/<path:filename>")
+def asset_file(filename):
+    """Serve files from ./assets (the dashboard logo/favicon lives there)."""
+    return send_from_directory(ASSETS_DIR, filename, max_age=86400)
+
+@app.route("/favicon.ico")
+def favicon_ico():
+    """Browsers request /favicon.ico by default – answer with the PNG logo."""
+    return send_from_directory(ASSETS_DIR, "netron.png",
+                               mimetype="image/png", max_age=86400)
 
 @app.route("/")
 def dashboard():
@@ -6220,13 +9965,14 @@ def print_banner():
             else "psutil poll (install scapy + run as root for deep capture)")
     print(f"""
 ╔{'═'*50}╗
-║     Netron v{VERSION} - Network Security       ║
+║{'Netron - Network Security':^50}║
 ╚{'═'*50}╝
   Gateway  : {monitor.gateway}
   Network  : {monitor.network}
   Mode     : {mode}
   Capture  : {cap}
-  Dashboard: http://localhost:{APP_PORT}
+  Bind     : {APP_HOST}:{APP_PORT}
+  Dashboard: http://{'localhost' if APP_HOST in ('0.0.0.0', '127.0.0.1') else APP_HOST}:{APP_PORT}
 """)
 
 if __name__ == "__main__":
